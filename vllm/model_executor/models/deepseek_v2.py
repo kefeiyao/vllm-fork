@@ -507,14 +507,30 @@ class DeepseekV2MLAAttention(nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
+        import torch
+        rank = 0
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
         if self.q_lora_rank is not None:
+            if rank == 0:
+                print(f"hidden_states.shape: {hidden_states.shape}, q_a_proj.input_size: {self.q_a_proj.input_size}, q_a_proj.output_size: {self.q_a_proj.output_size}, q_a_proj.output_size_per_partition: {self.q_a_proj.output_size_per_partition}")
+                print(f"hidden_states.dtype: {hidden_states.dtype}, q_a_proj.weight.dtype: {self.q_a_proj.weight.dtype}")
             ckq = self.q_a_proj(hidden_states)[0]
+            if rank == 0:
+                print(f"ckq.shape: {ckq.shape}")
             hidden_states_or_q_c = self.q_a_layernorm(ckq)
         else:
             hidden_states_or_q_c = hidden_states
+        if rank == 0:
+            print(f"kv_a_proj_with_mqa.input_size: {self.kv_a_proj_with_mqa.input_size}, kv_a_proj_with_mqa.output_size: {self.kv_a_proj_with_mqa.output_size}, kv_a_proj_with_mqa.output_size_per_partition: {self.kv_a_proj_with_mqa.output_size_per_partition}")
+            print(f"hidden_states.dtype: {hidden_states.dtype}, kv_a_proj_with_mqa.weight.dtype: {self.kv_a_proj_with_mqa.weight.dtype}")
         kv_c, k_pe = self.kv_a_proj_with_mqa(hidden_states)[0].split(
             [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        if rank == 0:
+            print(f"kv_c.shape: {kv_c.shape}, k_pe.shape: {k_pe.shape}")
         kv_c_normed = self.kv_a_layernorm(kv_c.contiguous())
+        if rank == 0:
+            print(f"kv_c_normed.shape: {kv_c_normed.shape}")
         return self.mla_attn(hidden_states_or_q_c, kv_c_normed, k_pe, kv_cache,
                              attn_metadata)
 

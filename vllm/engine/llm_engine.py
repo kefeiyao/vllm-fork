@@ -217,7 +217,7 @@ class LLMEngine:
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
         use_cached_outputs: bool = False,
     ) -> None:
-
+        #import vllm.engine.monkey_patch_dist
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -1591,16 +1591,16 @@ class LLMEngine:
             else:
                 role_allowed = (want_p or want_d)
             # Debug print for tracking profiler start conditions
-            #if rank_allowed and role_allowed:
-            #    print(
-            #        f"[Profiler Debug] Checking start conditions: "
-            #        f"target_inflight={target_inflight}, "
-            #        f"target_start_step={target_start_step}, "
-            #        f"profile_steps={profile_steps}, "
-            #        f"current_inflight={current_inflight}, "
-            #        f"min_generated_pos={min_generated_pos}, "
-            #        f"_profile_started={self._profile_started}"
-            #    )
+            if rank_allowed and role_allowed:
+                print(
+                    f"[Profiler Debug] Checking start conditions: "
+                    f"target_inflight={target_inflight}, "
+                    f"target_start_step={target_start_step}, "
+                    f"profile_steps={profile_steps}, "
+                    f"current_inflight={current_inflight}, "
+                    f"min_generated_pos={min_generated_pos}, "
+                    f"_profile_started={self._profile_started}"
+                )
             # Start when:
             #  - rank allowed, role allowed, profile_steps > 0
             #  - inflight equals target

@@ -16,6 +16,9 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
 def tensor_model_parallel_all_gather(input_: torch.Tensor,
                                      dim: int = -1) -> torch.Tensor:
     """All-gather the input tensor across model parallel group."""
+    import traceback
+    print("Callstack for tensor_model_parallel_all_gather:")
+    traceback.print_stack()
     return get_tp_group().all_gather(input_, dim)
 
 

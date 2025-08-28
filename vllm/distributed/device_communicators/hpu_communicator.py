@@ -45,6 +45,9 @@ class HpuCommunicator:
                                     device=x.device)
         # All-gather.
         htorch.core.mark_step()
+        import traceback
+        print("Callstack for HpuCommunicator.all_gather:")
+        traceback.print_stack()
         dist.all_gather_into_tensor(output_tensor, x, group=self.group)
         # Reshape
         if dim != 0:

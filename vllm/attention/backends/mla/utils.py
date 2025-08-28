@@ -222,10 +222,21 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
             # Convert from (B, N, L) to (N, B, L)
             x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
             # Multiply (N, B, L) x (N, L, V) -> (N, B, V)
+            if torch.distributed.get_rank()==0:
+                print(f"_v_up_proj_and_o_proj before bmm, x.shape: {x.shape}, W_UV.shape: {self.W_UV.shape}")
+                print(f"_v_up_proj_and_o_proj before bmm, x.dtype: {x.dtype}, W_UV.dtype: {self.W_UV.dtype}")
             x = torch.bmm(x, self.W_UV)
+            if torch.distributed.get_rank()==0:
+                print(f"_v_up_proj_and_o_proj after bmm, x.shape: {x.shape}")
             # Convert from (N, B, V) to (B, N * V)
             x = x.transpose(0, 1).reshape(-1, self.num_heads * self.v_head_dim)
-            return self.o_proj(x)[0]
+            if torch.distributed.get_rank()==0:
+                print(f"_v_up_proj_and_o_proj before o_proj, x.shape: {x.shape}, o_proj.input_size: {self.o_proj.input_size}, o_proj.input_size_per_partition: {self.o_proj.input_size_per_partition}, o_proj.output_size: {self.o_proj.output_size}")
+                print(f"_v_up_proj_and_o_proj before o_proj, x.dtype: {x.dtype}, o_proj.weight.dtype: {self.o_proj.weight.dtype}")
+            out=self.o_proj(x)[0]
+            if torch.distributed.get_rank()==0:
+                print(f"_v_up_proj_and_o_proj after o_proj, out.shape: {out.shape}")
+            return out
 
     def _q_proj_and_k_up_proj(self, x):
         if envs.VLLM_MLA_PERFORM_MATRIX_ABSORPTION:
@@ -253,14 +264,24 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
             return torch.matmul(x, self.W_Q_UK)\
                 .view(-1, self.num_heads, self.kv_lora_rank)
         else:
+            if torch.distributed.get_rank() == 0:
+                print(f"decode: x.shape: {x.shape}, q_proj.input_size: {self.q_proj.input_size}, q_proj.output_size: {self.q_proj.output_size}, q_proj.output_size_per_partition: {self.q_proj.output_size_per_partition}")
+                print(f"decode: x.dtype: {x.dtype}, q_proj.weight.dtype: {self.q_proj.weight.dtype}")
             q_nope, q_pe = self.q_proj(x)[0]\
                 .view(-1, self.num_heads, self.qk_head_dim)\
                 .split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+            if torch.distributed.get_rank() == 0:
+                print(f"decode: after q_proj, q_nope.shape: {q_nope.shape}, q_pe.shape: {q_pe.shape}")
 
             # Convert from (B, N, P) to (N, B, P)
             q_nope = q_nope.transpose(0, 1)
             # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
+            if torch.distributed.get_rank() == 0:
+                print(f"decode: before bmm, q_nope.shape: {q_nope.shape}, W_UK_T.shape: {self.W_UK_T.shape}")
+                print(f"decode: q_nope.dtype: {q_nope.dtype}, W_UK_T.dtype: {self.W_UK_T.dtype}")
             ql_nope = torch.bmm(q_nope, self.W_UK_T)
+            if torch.distributed.get_rank() == 0:
+                print(f"decode: after bmm, ql_nope.shape: {ql_nope.shape}")
             # Convert from (N, B, L) to (B, N, L)
             return ql_nope.transpose(0, 1), q_pe
 

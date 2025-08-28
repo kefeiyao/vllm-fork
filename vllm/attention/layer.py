@@ -195,6 +195,10 @@ class Attention(nn.Module):
                 forward_context = get_forward_context()
                 ctx_attn_metadata = forward_context.attn_metadata
                 self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+                def shape_or_none(x):
+                    return "None" if x is None else x.shape
+                if torch.distributed.get_rank() == 0:
+                    print(f"query.shape: {shape_or_none(query)}, key.shape: {shape_or_none(key)}, value.shape: {shape_or_none(value)}")
                 return self.impl.forward(self, query, key, value,
                                          self_kv_cache, ctx_attn_metadata)
             else:

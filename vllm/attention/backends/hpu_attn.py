@@ -223,22 +223,35 @@ def flat_pa_mla(query, key_cache, value_cache, block_list, block_mapping,
                 block_bias, block_scales, block_groups, scale, matmul_qk_op,
                 matmul_av_op, batch2block_matmul_op, block2batch_matmul_op,
                 keys_fetch_func, values_fetch_func, kv_lora_rank, kv_in_fp8):
+    import torch.distributed as dist
+    def is_rank_0():
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank() == 0
+        return True
+
     key_cache = key_cache.unsqueeze(2)
 
     batch_size = query.size(0)
     q_heads = query.size(1)
     kv_heads = key_cache.size(2)
-
+    if is_rank_0():
+        print(f"before batch2block: query.shape: {query.shape}, key_cache.shape: {key_cache.shape}, block_mapping.shape: {block_mapping.shape}, block_list.shape: {block_list.shape}")
+        print(f"query.dtype: {query.dtype}, key_cache.dtype: {key_cache.dtype}, block_mapping.dtype: {block_mapping.dtype}, block_list.dtype: {block_list.dtype}")
     query = ops.batch2block(scale * query, block_mapping,
                             batch2block_matmul_op).unsqueeze(-2)
+    if is_rank_0():
+        print(f"query.shape after batch2block: {query.shape}")
     key = keys_fetch_func(key_cache, block_list)
+    if is_rank_0():
+        print(f"key.shape after keys_fetch_func: {key.shape}")
     if value_cache is not None:
         value_cache = value_cache.unsqueeze(2)
         value = values_fetch_func(value_cache, block_list)
         key = torch.concat((value, key), dim=-1)
     else:
         value = key[..., :kv_lora_rank]
-
+    if is_rank_0():
+        print(f"value.shape after slicing key: {value.shape}")
     key = key.transpose(1, 2)
     value = value.transpose(1, 2)
     block_bias = block_bias.view(key.size(0), 1, 1, -1)
@@ -250,7 +263,9 @@ def flat_pa_mla(query, key_cache, value_cache, block_list, block_mapping,
         key = key.transpose(3, 4)
     else:
         key = key.transpose(2, 3)
-
+    if is_rank_0():
+        print(f"before qk matmul, key.shape: {key.shape}, query.shape: {query.shape}")
+        print(f"key.dtype: {key.dtype}, query.dtype: {query.dtype}")
     attn = matmul_qk_op(query, key)
 
     if "fp32_softmax" in enabled_flags():
@@ -280,7 +295,11 @@ def flat_pa_mla(query, key_cache, value_cache, block_list, block_mapping,
                                 matmul_av_op=matmul_av_op,
                                 batch2block_matmul_op=batch2block_matmul_op,
                                 block2batch_matmul_op=block2batch_matmul_op)
+    if is_rank_0():
+        print(f"before block2batch, attn.shape: {attn.shape}, block_mapping.shape: {block_mapping.shape}")
     attn = ops.block2batch(attn, block_mapping, block2batch_matmul_op)
+    if is_rank_0():
+        print(f"after block2batch, attn.shape: {attn.shape}")
     attn = attn.squeeze(-2)
     if kv_heads != q_heads:
         attn = attn.flatten(1, 2)
@@ -396,21 +415,35 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
         assert hasattr(attn_metadata,
                        "input_positions"), f"attn meta: {attn_metadata}"
 
+        def is_rank_0():
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                return dist.get_rank() == 0
+            return True
+
         if not is_prefill:
             if envs.VLLM_MLA_PERFORM_MATRIX_ABSORPTION:
                 q_nope = self._q_proj_and_k_up_proj(hidden_states_or_q_c)
                 q_pe = torch.matmul(hidden_states_or_q_c, self.W_QR)\
                     .view(-1, self.num_heads, self.qk_rope_head_dim)
             else:
+                if is_rank_0():
+                    print(f"decode: hidden_states_or_q_c.shape: {hidden_states_or_q_c.shape}, q_proj.input_size: {self.q_proj.input_size}, q_proj.output_size: {self.q_proj.output_size}, q_proj.output_size_per_partition: {self.q_proj.output_size_per_partition}")
                 q_nope, q_pe = self._q_proj_and_k_up_proj(hidden_states_or_q_c)
+                if is_rank_0():
+                    print(f"decode: after q_proj, q_nope.shape: {q_nope.shape}, q_pe.shape: {q_pe.shape}")
             input_positions = attn_metadata.input_positions.view(-1)
             q_pe, k_pe = \
                 self.rotary_emb(input_positions, q_pe, k_pe)
         else:
+            if is_rank_0():
+                print(f"prefill: hidden_states_or_q_c.shape: {hidden_states_or_q_c.shape}, q_proj.input_size: {self.q_proj.input_size}, q_proj.output_size: {self.q_proj.output_size}, q_proj.output_size_per_partition: {self.q_proj.output_size_per_partition}")
             q = self.q_proj(hidden_states_or_q_c)[0]\
                 .view(-1, self.num_heads, self.qk_head_dim)
 
             q_pe = q[..., self.qk_nope_head_dim:]
+            if is_rank_0():
+                print(f"prefill: after q_proj, q.shape: {q.shape}, q_pe.shape: {q_pe.shape}")
 
             input_positions = attn_metadata.input_positions.view(-1)
             # TODO(lucas): there must be a nicer way to write this line
@@ -442,9 +475,13 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
             v_cache = None
 
         if is_prefill:
+            if is_rank_0():
+                print(f"before _forward_prefill: q.shape: {q.shape}, k_c_normed.shape: {k_c_normed.shape}, k_pe.shape: {k_pe.shape}, attn_metadata: {attn_metadata}, batch_size: {batch_size}")
             return self._forward_prefill(q, k_c_normed, k_pe, attn_metadata,
                                          batch_size)
         else:
+            if is_rank_0():
+                print(f"before _forward_decode: q_nope.shape: {q_nope.shape}, q_pe.shape: {q_pe.shape}, k_cache.shape: {k_cache.shape}, v_cache.shape: {v_cache.shape if v_cache is not None else None}, batch_size: {batch_size}")
             return self._forward_decode(q_nope, q_pe, (k_cache, v_cache), attn_metadata,
                                         batch_size)
 
@@ -452,11 +489,22 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
                          k_pe: torch.Tensor,
                          attn_metadata: HPUAttentionMetadata,
                          batch_size: int) -> torch.Tensor:
+        import torch.distributed as dist
+        def is_rank_0():
+            if dist.is_available() and dist.is_initialized():
+                return dist.get_rank() == 0
+            return True
+
+        if is_rank_0():
+            print(f"kv_b_proj.input_size: {self.kv_b_proj.input_size}, kv_b_proj.output_size: {self.kv_b_proj.output_size}, kv_b_proj.output_size_per_partition: {self.kv_b_proj.output_size_per_partition}")
         kv_nope = self.kv_b_proj(k_c_normed)[0]\
             .view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+        if is_rank_0():
+            print(f"kv_nope.shape: {kv_nope.shape}")
         k_nope, v = kv_nope\
             .split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-
+        if is_rank_0():
+            print(f"k_nope.shape: {k_nope.shape}, k_pe.shape: {k_pe.shape}, v.shape: {v.shape}")
         k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
 
         # For MLA the v head dim is smaller than qk head dim so we pad out
@@ -467,6 +515,8 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
         k = k.view(batch_size, -1, self.num_heads, self.qk_head_dim)
         v_padded = v_padded.view(batch_size, -1, self.num_heads,
                                  self.qk_head_dim)
+        if is_rank_0():
+            print(f"q.shape: {q.shape}, k.shape: {k.shape}, v_padded.shape: {v_padded.shape}")
         out = ops.prompt_attention(
             q,
             k,
@@ -482,10 +532,16 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
             if self.prefill_use_fusedsdpa else None,
         )
         attn_output = out.view(batch_size, -1, self.num_heads, q.shape[-1])
+        if is_rank_0():
+            print(f"prefill - attn_output.shape: {attn_output.shape}")
         attn_output = attn_output[..., :v.shape[-1]]\
                 .reshape(batch_size, -1, self.num_heads * v.shape[-1])
-
-        return self.o_proj(attn_output)[0]
+        if is_rank_0():
+            print(f"prefill - attn_output.shape: {attn_output.shape}, o_proj.input_size: {self.o_proj.input_size}, o_proj.output_size: {self.o_proj.output_size}, o_proj.output_size_per_partition: {self.o_proj.output_size_per_partition}")
+        out = self.o_proj(attn_output)[0]
+        if is_rank_0():
+            print(f"out.shape: {out.shape}")
+        return out 
 
     def _forward_decode(self, q_nope: torch.Tensor, q_pe: torch.Tensor,
                         kv_cache: torch.Tensor,
