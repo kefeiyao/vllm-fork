@@ -13,7 +13,7 @@ export LD_LIBRARY_PATH=$LIBFABRIC_ROOT/lib:$LD_LIBRARY_PATH
 
 export PT_HPU_LAZY_MODE=1
 
-ray stop --force
+#ray stop --force
 
 # DO NOT change unless you fully understand its purpose
 export HABANA_VISIBLE_DEVICES="ALL"
@@ -39,9 +39,11 @@ block_size=128
 unset VLLM_HPU_LOG_STEP_GRAPH_COMPILATION PT_HPU_METRICS_GC_DETAILS GRAPH_VISUALIZATION
 export VLLM_HPU_LOG_STEP_GRAPH_COMPILATION=true
 export PT_HPU_METRICS_GC_DETAILS=1
-export GRAPH_VISUALIZATION=1
+#export GRAPH_VISUALIZATION=1
 
 #hl-prof-config --use-template profile_api_with_nics --fuser on --trace-analyzer on --gaudi2 --merged "hltv,csv"
+hl-prof-config --use-template profile_api_with_nics  --fuser on --trace-analyzer on
+
 
 #export HABANA_PROFILE=1
 #export VLLM_PROFILER_ENABLED=full
@@ -55,10 +57,11 @@ unset VLLM_PROMPT_SEQ_BUCKET_MIN VLLM_PROMPT_SEQ_BUCKET_STEP VLLM_PROMPT_SEQ_BUC
 unset VLLM_DECODE_BS_BUCKET_MIN VLLM_DECODE_BS_BUCKET_STEP VLLM_DECODE_BS_BUCKET_MAX
 unset VLLM_DECODE_BLOCK_BUCKET_MIN VLLM_DECODE_BLOCK_BUCKET_STEP VLLM_DECODE_BLOCK_BUCKET_MAX
 
-INC_FP8=0
+INC_FP8=1
 
 if [ "$INC_FP8" -eq 1 ]; then
-  model_path=/mnt/disk2/hf_models/DeepSeek-R1-G2/
+  #model_path=/mnt/disk2/hf_models/DeepSeek-R1-G2/
+  model_path=/host/mnt/disk001/HF_Models/DeepSeek-R1
 else
   model_path=/host/mnt/disk002/HF_Models/DeepSeek-R1-Gaudi3/
 fi
