@@ -24,4 +24,10 @@ HOST_DEVICE_MAP[wb94]="mlx5_2 mlx5_2 mlx5_4 mlx5_4"
 HOST_DEVICE_MAP[skyriver01]="mlx5_0 mlx5_0 mlx5_0 mlx5_0 mlx5_0 mlx5_0 mlx5_0 mlx5_0 mlx5_0 mlx5_0 mlx5_0 mlx5_0 mlx5_0 mlx5_0 mlx5_0 mlx5_0"
 HOST_DEVICE_MAP[skyriver02]="mlx5_0 mlx5_0 mlx5_0 mlx5_0 mlx5_0 mlx5_0 mlx5_0 mlx5_0 mlx5_0 mlx5_0 mlx5_0 mlx5_0 mlx5_0 mlx5_0 mlx5_0 mlx5_0"
 
+HOST_DEVICE_MAP[sys41]="mlx5_0 mlx5_0 mlx5_0 mlx5_0"
+HOST_DEVICE_MAP[sys43]="mlx5_0 mlx5_0 mlx5_0 mlx5_0"
+HOST_DEVICE_MAP[sys51]="mlx5_0 mlx5_0 mlx5_0 mlx5_0"
+HOST_DEVICE_MAP[sys53]="mlx5_0 mlx5_0 mlx5_0 mlx5_0"
+HOST_DEVICE_MAP[sys61]="mlx5_0 mlx5_0 mlx5_0 mlx5_0"
+HOST_DEVICE_MAP[sys62]="mlx5_0 mlx5_0 mlx5_0 mlx5_0"
 

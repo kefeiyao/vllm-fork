@@ -21,12 +21,14 @@ class LogSyncer:
         sync_interval: float = 2.0,
         follow: bool = True,
         max_size: int = 10 * 1024 * 1024,  # 10MB default
+        recent_minutes: int = 30,  # Only sync files modified within this many minutes
     ):
         self.local_dir = Path(local_dir)
         self.nfs_dir = Path(nfs_dir)
         self.sync_interval = sync_interval
         self.follow = follow
         self.max_size = max_size
+        self.recent_minutes = recent_minutes
         self.running = True
         
         # Ensure directories exist
@@ -129,13 +131,31 @@ class LogSyncer:
         except Exception as e:
             print(f"ERROR syncing {local_path} to {nfs_path}: {e}", file=sys.stderr)
 
+    def _is_recent_file(self, file_path: Path) -> bool:
+        """Check if file was modified within the last recent_minutes."""
+        if not file_path.exists():
+            return False
+        
+        try:
+            mtime = file_path.stat().st_mtime
+            age_seconds = time.time() - mtime
+            age_minutes = age_seconds / 60.0
+            return age_minutes <= self.recent_minutes
+        except OSError:
+            # If we can't stat the file, skip it
+            return False
+
     def sync_all(self):
-        """Sync all log files from local directory to NFS directory."""
+        """Sync all log files from local directory to NFS directory that were modified recently."""
         if not self.local_dir.exists():
             return
         
         # Find all log files in local directory
         for local_file in self.local_dir.glob("*.log"):
+            # Only sync files modified within the last recent_minutes
+            if not self._is_recent_file(local_file):
+                continue
+            
             # Maintain same directory structure in NFS
             relative_path = local_file.relative_to(self.local_dir)
             nfs_file = self.nfs_dir / relative_path
@@ -145,7 +165,7 @@ class LogSyncer:
     def run(self):
         """Main sync loop."""
         max_size_mb = self.max_size / (1024 * 1024)
-        print(f"LogSyncer: Syncing {self.local_dir} -> {self.nfs_dir} every {self.sync_interval}s (max size: {max_size_mb:.1f}MB)", file=sys.stderr)
+        print(f"LogSyncer: Syncing {self.local_dir} -> {self.nfs_dir} every {self.sync_interval}s (max size: {max_size_mb:.1f}MB, recent files only: {self.recent_minutes}min)", file=sys.stderr)
         
         while self.running:
             try:
@@ -186,6 +206,12 @@ def main():
         default=10 * 1024 * 1024,
         help="Maximum NFS log file size in bytes before rotation (default: 10MB)",
     )
+    parser.add_argument(
+        "--recent-minutes",
+        type=int,
+        default=30,
+        help="Only sync files modified within this many minutes (default: 30)",
+    )
 
     args = parser.parse_args()
 
@@ -195,6 +221,7 @@ def main():
         sync_interval=args.sync_interval,
         follow=not args.once,
         max_size=args.max_size,
+        recent_minutes=args.recent_minutes,
     )
 
     syncer.run()
