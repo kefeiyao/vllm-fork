@@ -5,10 +5,7 @@
 Run `pytest tests/quantization/test_fp8.py --forked`.
 """
 
-import logging
-
 import pytest
-import regex as re
 import torch
 
 from tests.quantization.utils import is_quant_method_supported
@@ -136,7 +133,7 @@ def test_kv_cache_model_load_and_run(
 @pytest.mark.parametrize(
     "use_rocm_aiter", [True, False] if current_platform.is_rocm() else [False]
 )
-def test_online_quantization(
+def test_load_fp16_model(
     vllm_runner,
     kv_cache_dtype: str,
     force_marlin: bool,
@@ -193,94 +190,6 @@ def test_online_quantization(
                 )
 
         llm.apply_model(check_model)
-
-        outputs = llm.generate_greedy(["Hello my name is"], max_tokens=4)
-        print(outputs[0][1])
-
-
-@pytest.mark.skipif(
-    not is_quant_method_supported("fp8"),
-    reason="FP8 is not supported on this GPU type.",
-)
-def test_online_quant_peak_mem(
-    vllm_runner,
-    monkeypatch,
-    caplog,
-) -> None:
-    # Disable multiprocessing so logs are captured in the main process
-    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-
-    # Enable propagation so caplog can capture vllm logs
-    vllm_logger = logging.getLogger("vllm")
-    original_propagate = vllm_logger.propagate
-    vllm_logger.propagate = True
-
-    try:
-        with vllm_runner(
-            "Qwen/Qwen1.5-MoE-A2.7B",
-            quantization="fp8",
-            enforce_eager=True,
-        ) as llm:
-            outputs = llm.generate_greedy(["Hello my name is"], max_tokens=4)
-            print(outputs[0][1])
-    finally:
-        vllm_logger.propagate = original_propagate
-
-    # Parse memory usage from captured logs
-    model_memory_gib = None
-    peak_memory_gib = None
-    for record in caplog.records:
-        if model_memory_gib is None:
-            match = re.search(r"Model loading took ([\d.]+) GiB memory", record.message)
-            if match:
-                model_memory_gib = float(match.group(1))
-        if peak_memory_gib is None:
-            match = re.search(
-                r"Peak GPU memory after loading weights: ([\d.]+) GiB", record.message
-            )
-            if match:
-                peak_memory_gib = float(match.group(1))
-
-    assert model_memory_gib is not None, "Could not find model loading memory log"
-    assert peak_memory_gib is not None, "Could not find peak memory log"
-    print(f"GPU memory used after loading weights: {model_memory_gib} GiB")
-    print(f"Peak GPU memory usage while loading weights: {peak_memory_gib} GiB")
-
-    # model specific, Qwen/Qwen1.5-MoE-A2.7B fp8 online quant uses ~13.94
-    # GiB for weight loading (bf16 checkpoint is ~28 GiB)
-    expected_model_memory_gib = 14.0
-
-    # for Qwen/Qwen1.5-MoE-A2.7B the number we see today is 14.98 GiB, which
-    # is 1.07x above model_memory_gib. A slightly higher number is expected as
-    # when we load and quantize weights in a streaming fashion we need to
-    # have individual weights in bf16 + fp8 alive at the same time.
-    expected_peak_memory_gib = expected_model_memory_gib * 1.12
-
-    assert model_memory_gib < expected_model_memory_gib, (
-        f"{model_memory_gib=} higher than {expected_model_memory_gib}"
-    )
-    assert peak_memory_gib < expected_peak_memory_gib, (
-        f"{peak_memory_gib=} higher than {expected_peak_memory_gib}"
-    )
-
-
-@pytest.mark.skipif(
-    not is_quant_method_supported("fp8"),
-    reason="FP8 is not supported on this GPU type.",
-)
-def test_online_quant_load_format_dummy(
-    vllm_runner,
-    monkeypatch,
-    caplog,
-) -> None:
-    with vllm_runner(
-        "Qwen/Qwen1.5-MoE-A2.7B",
-        quantization="fp8",
-        enforce_eager=True,
-        load_format="dummy",
-    ) as llm:
-        outputs = llm.generate_greedy(["Hello my name is"], max_tokens=4)
-        print(outputs[0][1])
 
 
 @pytest.mark.skipif(
