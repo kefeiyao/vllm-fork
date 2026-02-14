@@ -1,0 +1,7 @@
+{
+        "local_hostname": "10.165.91.18",
+        "metadata_server": "etcd://10.165.91.32:3379",
+        "protocol": "rdma",
+        "device_name": ["mlx5_0","mlx5_0","mlx5_8","mlx5_8"],
+        "master_server_address": "10.165.91.32:50001"
+}
