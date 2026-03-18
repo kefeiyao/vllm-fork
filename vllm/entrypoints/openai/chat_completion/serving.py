@@ -1282,8 +1282,6 @@ class OpenAIServingChat(OpenAIServing):
         request_metadata: RequestResponseMetadata,
         reasoning_parser: ReasoningParser | None = None,
     ) -> ErrorResponse | ChatCompletionResponse:
-        from vllm.tokenizers.mistral import MistralTokenizer
-
         created_time = int(time.time())
         final_res: RequestOutput | None = None
 
@@ -1426,7 +1424,7 @@ class OpenAIServingChat(OpenAIServing):
                         # Generate ID using the correct format (kimi_k2 or random),
                         # but leave it to the class if it's Mistral to preserve
                         # 9-char IDs
-                        if isinstance(tokenizer, MistralTokenizer):
+                        if is_mistral_tokenizer(tokenizer):
                             tool_call_class_items.append(tool_call_class(function=tc))
                         else:
                             generated_id = make_tool_call_id(
@@ -1459,7 +1457,7 @@ class OpenAIServingChat(OpenAIServing):
                         # Generate ID using the correct format (kimi_k2 or random),
                         # but leave it to the class if it's Mistral to preserve
                         # 9-char IDs
-                        if isinstance(tokenizer, MistralTokenizer):
+                        if is_mistral_tokenizer(tokenizer):
                             tool_call_class_items.append(
                                 tool_call_class(function=tool_call)
                             )
@@ -1509,7 +1507,7 @@ class OpenAIServingChat(OpenAIServing):
                             # Generate ID using the correct format (kimi_k2 or random),
                             # but leave it to the class if it's Mistral to preserve
                             # 9-char IDs
-                            if isinstance(tokenizer, MistralTokenizer):
+                            if is_mistral_tokenizer(tokenizer):
                                 tool_call_items.append(tool_call_class(function=tc))
                             else:
                                 generated_id = make_tool_call_id(
