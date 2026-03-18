@@ -1960,6 +1960,54 @@ class NixlConnectorWorker:
                     "d2h",
                 )
 
+    def post_process_hetero_tp_nhd_on_receive(
+        self,
+        abs_tp_ratio: int,
+        block_ids_list: list[list[int]],
+    ):
+        """
+        Fix KV cache layout after heterogeneous TP transfer with NHD layout.
+
+        When P TP > D TP and the cache uses NHD layout [N, H, D], the
+        byte-range split places remote ranks' data sequentially in the
+        slot dimension instead of interleaving in the head dimension.
+        This reshapes the data to correctly interleave heads from
+        different remote TP ranks.
+        """
+        if len(self.device_kv_caches) == 0:
+            return
+        assert self.kv_topo is not None
+        split_k_and_v = self.kv_topo.split_k_and_v
+
+        for block_ids in block_ids_list:
+            indices = torch.tensor(
+                block_ids, device=self.device_type, dtype=torch.long
+            )
+            for _, cache_or_caches in self.device_kv_caches.items():
+                cache_list = (
+                    cache_or_caches if split_k_and_v else [cache_or_caches]
+                )
+                for cache in cache_list:
+                    blocks = cache.index_select(0, indices)
+                    n = blocks.shape[0]
+                    block_size = blocks.shape[1]  # N dimension
+                    num_kv_heads = blocks.shape[2]  # H dimension
+                    head_dim = blocks.shape[3]  # D dimension
+                    heads_per_rank = num_kv_heads // abs_tp_ratio
+                    result = (
+                        blocks.reshape(
+                            n,
+                            abs_tp_ratio,
+                            block_size,
+                            heads_per_rank,
+                            head_dim,
+                        )
+                        .permute(0, 2, 1, 3, 4)
+                        .contiguous()
+                        .reshape_as(blocks)
+                    )
+                    cache.index_copy_(0, indices, result)
+
     def post_process_device_kv_on_receive(
         self,
         block_size_ratio: int,
@@ -2042,6 +2090,7 @@ class NixlConnectorWorker:
             )
 
         block_ids_for_blocksize_post_process = defaultdict(list)
+        block_ids_for_hetero_tp_nhd: dict[int, list[list[int]]] = {}
         for req_id in done_recving:
             # clean up metadata for completed requests
             meta = self._recving_metadata.pop(req_id, None)
@@ -2049,6 +2098,23 @@ class NixlConnectorWorker:
             assert meta.remote is not None
             if self.use_host_buffer:
                 self.sync_recved_kv_to_device(req_id, meta)
+
+            # post processing for hetero TP with NHD layout
+            tp_ratio = self.kv_topo.tp_ratio_from_engine_id(
+                meta.remote.engine_id
+            )
+            if (
+                not self.use_mla
+                and tp_ratio < 0
+                and self.kv_cache_layout == "NHD"
+                and not self.enable_permute_local_kv
+            ):
+                abs_tp_ratio = -tp_ratio
+                if abs_tp_ratio not in block_ids_for_hetero_tp_nhd:
+                    block_ids_for_hetero_tp_nhd[abs_tp_ratio] = []
+                block_ids_for_hetero_tp_nhd[abs_tp_ratio].append(
+                    meta.local_physical_block_ids[0]
+                )
 
             # post processing for heteroblocksize
             block_size_ratio = self.kv_topo.block_size_ratio_from_engine_id(
@@ -2061,6 +2127,10 @@ class NixlConnectorWorker:
                 block_ids_for_blocksize_post_process[block_size_ratio].append(
                     meta.local_physical_block_ids[0]
                 )
+        for abs_tp_ratio, block_ids_list in block_ids_for_hetero_tp_nhd.items():
+            self.post_process_hetero_tp_nhd_on_receive(
+                abs_tp_ratio, block_ids_list
+            )
         for (
             block_size_ratio,
             block_ids_list,
