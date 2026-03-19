@@ -138,10 +138,11 @@ class xpu_ops:
             assert len(window_size) == 2
             real_window_size = (window_size[0], window_size[1])  # noqa: F841
 
-        # In encode attention, k and v maybe not contiguous and current
-        # kernel can't handle it
-        if block_table is None:
+        # In encode or paged attention, k and v may not be contiguous and
+        # the kernel can't handle it
+        if not k.is_contiguous():
             k = k.contiguous()
+        if not v.is_contiguous():
             v = v.contiguous()
         return flash_attn_varlen_func(
             out=out,
