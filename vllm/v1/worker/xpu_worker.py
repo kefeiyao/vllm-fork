@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import ctypes
 import gc
 import os
 from typing import Any
@@ -20,6 +21,97 @@ from vllm.v1.worker.xpu_model_runner import XPUModelRunner, XPUModelRunnerV2
 from .utils import request_memory
 
 logger = init_logger(__name__)
+
+
+def _parse_cpu_list(cpu_str: str) -> set[int]:
+    """Parse a CPU list string like '0-15,64-79' into a set of CPU IDs."""
+    cpus: set[int] = set()
+    for part in cpu_str.split(","):
+        part = part.strip()
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            cpus.update(range(int(lo), int(hi) + 1))
+        else:
+            cpus.add(int(part))
+    return cpus
+
+
+def _bind_numa(local_rank: int) -> None:
+    """Bind this process to CPUs and memory node specified by VLLM_NUMA_CONTROL.
+
+    Format: semicolon-separated entries, one per local_rank (positional).
+        Each entry: cpulist:memnode
+    Example (4 workers, 2 per NUMA node, CPUs partitioned):
+        VLLM_NUMA_CONTROL="0-15,64-79:0;16-31,80-95:0;32-47,96-111:1;48-63,112-127:1"
+    """
+    numa_control = os.environ.get("VLLM_NUMA_CONTROL")
+    if not numa_control:
+        return
+
+    entries = numa_control.split(";")
+    if local_rank >= len(entries):
+        logger.warning(
+            "VLLM_NUMA_CONTROL has %d entries but local_rank is %d, "
+            "skipping NUMA binding",
+            len(entries),
+            local_rank,
+        )
+        return
+
+    entry = entries[local_rank].strip()
+    if not entry:
+        logger.info("VLLM_NUMA_CONTROL entry for rank %d is empty, skipping",
+                     local_rank)
+        return
+
+    if ":" not in entry:
+        raise ValueError(
+            f"Invalid VLLM_NUMA_CONTROL entry for rank {local_rank}: "
+            f"'{entry}'. Expected format: 'cpulist:memnode' "
+            f"(e.g. '0-15,64-79:0')")
+
+    cpu_str, mem_str = entry.rsplit(":", 1)
+    cpu_ids = _parse_cpu_list(cpu_str)
+    mem_node = int(mem_str)
+
+    # 1. Pin CPUs
+    os.sched_setaffinity(0, cpu_ids)
+    logger.info(
+        "Rank %d: CPU affinity set to %d CPUs (node %d)",
+        local_rank, len(cpu_ids), mem_node,
+    )
+
+    # 2. Pin memory node via libnuma
+    try:
+        libnuma = ctypes.CDLL("libnuma.so.1")
+        libnuma.numa_available.restype = ctypes.c_int
+        if libnuma.numa_available() < 0:
+            logger.warning("libnuma reports NUMA not available, "
+                           "skipping memory binding")
+            return
+
+        libnuma.numa_allocate_nodemask.restype = ctypes.c_void_p
+        libnuma.numa_bitmask_setbit.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint]
+        libnuma.numa_bitmask_setbit.restype = ctypes.c_void_p
+        libnuma.numa_set_membind.argtypes = [ctypes.c_void_p]
+        libnuma.numa_set_membind.restype = None
+        libnuma.numa_bitmask_free.argtypes = [ctypes.c_void_p]
+        libnuma.numa_bitmask_free.restype = None
+
+        nodemask = libnuma.numa_allocate_nodemask()
+        libnuma.numa_bitmask_setbit(nodemask, mem_node)
+        libnuma.numa_set_membind(nodemask)
+        libnuma.numa_bitmask_free(nodemask)
+        logger.info(
+            "Rank %d: memory bound to NUMA node %d",
+            local_rank, mem_node,
+        )
+    except OSError:
+        logger.warning(
+            "libnuma.so.1 not found, skipping memory node binding. "
+            "CPU affinity is still set.")
+
 
 
 class XPUWorker(Worker):
@@ -53,6 +145,9 @@ class XPUWorker(Worker):
             )
 
     def init_device(self):
+        # Bind CPU affinity and memory node before any allocations
+        _bind_numa(self.local_rank)
+
         device = self.device_config.device
         if (
             isinstance(device, torch.device)
