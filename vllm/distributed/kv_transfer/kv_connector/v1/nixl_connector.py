@@ -2040,8 +2040,12 @@ class NixlConnectorWorker:
         block_size_ratio = self.kv_topo.block_size_ratio_from_engine_id(
             remote_engine_id
         )
-        # Num kv_heads > tp_size and P TP > D TP case, not supported
-        assert not (tp_ratio < 0 and self.kv_topo.is_kv_replicated(remote_engine_id))
+        # P TP > D TP with genuinely replicated KV (remote TP > kv_heads)
+        # is not supported. When remote TP == kv_heads it's a perfect
+        # partition (1 unique head per rank), not replication.
+        remote_tp = self._tp_size[remote_engine_id]
+        genuinely_replicated = remote_tp > self.kv_topo.total_num_kv_heads
+        assert not (tp_ratio < 0 and genuinely_replicated)
 
         if self._is_hma_required:
             assert block_size_ratio == 1, (
@@ -2078,7 +2082,7 @@ class NixlConnectorWorker:
 
         # Block len can only vary across layers when using MLA.
         remote_block_len = nixl_agent_meta.block_lens[0]
-        if self.use_mla or self.kv_topo.is_kv_replicated(remote_engine_id):
+        if self.use_mla or genuinely_replicated:
             # With replicated KV cache, only the number of blocks can differ.
             for i in range(len(self.block_len_per_layer)):
                 assert (
@@ -2185,6 +2189,22 @@ class NixlConnectorWorker:
         assert self.kv_topo is not None
         split_k_and_v = self.kv_topo.split_k_and_v
 
+        def _interleave_heads(blocks: torch.Tensor, abs_tp_ratio: int):
+            """Interleave heads from |tp_ratio| remote ranks in NHD block."""
+            n = blocks.shape[0]
+            block_size = blocks.shape[1]  # N dimension
+            num_kv_heads = blocks.shape[2]  # H dimension
+            head_dim = blocks.shape[3]  # D dimension
+            heads_per_rank = num_kv_heads // abs_tp_ratio
+            return (
+                blocks.reshape(
+                    n, abs_tp_ratio, block_size, heads_per_rank, head_dim
+                )
+                .permute(0, 2, 1, 3, 4)
+                .contiguous()
+                .reshape_as(blocks)
+            )
+
         for block_ids in block_ids_list:
             indices = torch.tensor(
                 block_ids, device=self.device_type, dtype=torch.long
@@ -2195,23 +2215,15 @@ class NixlConnectorWorker:
                 )
                 for cache in cache_list:
                     blocks = cache.index_select(0, indices)
-                    n = blocks.shape[0]
-                    block_size = blocks.shape[1]  # N dimension
-                    num_kv_heads = blocks.shape[2]  # H dimension
-                    head_dim = blocks.shape[3]  # D dimension
-                    heads_per_rank = num_kv_heads // abs_tp_ratio
-                    result = (
-                        blocks.reshape(
-                            n,
-                            abs_tp_ratio,
-                            block_size,
-                            heads_per_rank,
-                            head_dim,
-                        )
-                        .permute(0, 2, 1, 3, 4)
-                        .contiguous()
-                        .reshape_as(blocks)
-                    )
+                    if blocks.ndim == 4:
+                        # [N, block_size, num_kv_heads, head_dim]
+                        result = _interleave_heads(blocks, abs_tp_ratio)
+                    else:
+                        # blocks-first: [N, 2, block_size, num_kv_heads, head_dim]
+                        result = torch.stack([
+                            _interleave_heads(blocks[:, kv], abs_tp_ratio)
+                            for kv in range(blocks.shape[1])
+                        ], dim=1)
                     cache.index_copy_(0, indices, result)
 
     def post_process_device_kv_on_receive(
@@ -2313,7 +2325,8 @@ class NixlConnectorWorker:
                 not self.use_mla
                 and tp_ratio < 0
                 and self.kv_cache_layout == "NHD"
-                and not self.enable_permute_local_kv
+                and not (self.enable_permute_local_kv
+                         and self.use_host_buffer)
             ):
                 abs_tp_ratio = -tp_ratio
                 if abs_tp_ratio not in block_ids_for_hetero_tp_nhd:
@@ -2327,7 +2340,8 @@ class NixlConnectorWorker:
                 meta.remote.engine_id
             )
             if not self.use_mla and (
-                block_size_ratio > 1 or self.enable_permute_local_kv
+                block_size_ratio > 1
+                or (self.enable_permute_local_kv and self.use_host_buffer)
             ):
                 assert not self._is_hma_required
                 block_ids_for_blocksize_post_process[block_size_ratio].append(
