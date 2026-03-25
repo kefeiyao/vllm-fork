@@ -149,7 +149,8 @@ def _synchronize_dp_ranks(
     # sizes across DP ranks currently).
     # Use the synced runtime cudagraph mode rather than the compilation config
     # so we can avoid padding when cudagraph is not enabled for this step.
-    should_dp_pad = synced_cudagraph_mode != 0 or should_ubatch
+    # HACK: Force DP padding to WA the accuracy issue 
+    should_dp_pad = True  # synced_cudagraph_mode != 0 or should_ubatch
 
     # Pad all DP ranks up to the maximum token count across ranks if
     # should_dp_pad is True
