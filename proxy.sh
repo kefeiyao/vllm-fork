@@ -1,0 +1,1 @@
+python3 /workspace/vllm/tests/v1/kv_connector/nixl_integration/toy_proxy_server.py --prefiller-host localhost --prefiller-port 8100 --decoder-host localhost --decoder-port 8200 --host localhost --port 8300 &> proxy.log &
