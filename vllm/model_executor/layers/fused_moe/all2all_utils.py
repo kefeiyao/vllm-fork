@@ -25,11 +25,12 @@ from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEPrepareAndFinalize,
 )
 from vllm.model_executor.layers.fused_moe.prepare_finalize import (
+    VelociDeepEPPrepareAndFinalize,
     make_moe_prepare_and_finalize_naive_dp_ep,
     make_moe_prepare_and_finalize_no_dp_ep,
 )
 from vllm.platforms import current_platform
-from vllm.utils.import_utils import has_deep_ep, has_mori, has_nixl_ep
+from vllm.utils.import_utils import has_deep_ep, has_mori, has_nixl_ep, has_veloci_deepep
 
 logger = init_logger(__name__)
 
@@ -80,6 +81,11 @@ def maybe_roundup_layer_hidden_size(
 
     if moe_parallel_config.use_nixl_ep_kernels:
         hidden_size = NixlEPPrepareAndFinalize.maybe_roundup_layer_hidden_size(
+            hidden_size
+        )
+
+    if moe_parallel_config.use_veloci_deepep_kernels and has_veloci_deepep():
+        hidden_size = VelociDeepEPPrepareAndFinalize.maybe_roundup_layer_hidden_size(
             hidden_size
         )
 
@@ -270,5 +276,56 @@ def maybe_make_prepare_finalize(
             physical_to_global=physical_to_global,
             local_expert_global_ids=local_expert_global_ids,
         )
+
+    elif moe.use_veloci_deepep_kernels:
+        assert quant_config is not None
+        # VelociDeepEP: use veloci_deepep.Buffer (LL) when available,
+        # otherwise fall back to oneCCL/NCCL all_to_all.
+        global_to_physical = physical_to_global = local_expert_global_ids = None
+        if routing_tables is not None:
+            (
+                global_to_physical,
+                physical_to_global,
+                local_expert_global_ids,
+            ) = routing_tables
+
+        if has_veloci_deepep():
+            from .prepare_finalize.veloci_deepep import VELOCI_QUANT_BLOCK_SHAPE
+
+            all_to_all_args = dict(
+                max_num_tokens_per_dp_rank=moe.max_num_tokens,
+                token_hidden_size=moe.hidden_dim,
+                num_ep_ranks=all2all_manager.world_size,
+                num_global_experts=moe.num_experts,
+                num_local_experts=(
+                    moe.num_experts // all2all_manager.world_size
+                ),
+            )
+            handle = all2all_manager.get_handle(all_to_all_args)
+
+            use_fp8_dispatch = (
+                quant_config.quant_dtype == current_platform.fp8_dtype()
+                and quant_config.block_shape == VELOCI_QUANT_BLOCK_SHAPE
+            )
+
+            prepare_finalize = VelociDeepEPPrepareAndFinalize(
+                num_dispatchers=all2all_manager.world_size,
+                buffer=handle,
+                max_tokens_per_rank=moe.max_num_tokens,
+                use_fp8_dispatch=use_fp8_dispatch,
+                is_sequence_parallel=(
+                    moe.moe_parallel_config.is_sequence_parallel
+                ),
+                global_to_physical=global_to_physical,
+                physical_to_global=physical_to_global,
+                local_expert_global_ids=local_expert_global_ids,
+            )
+        else:
+            prepare_finalize = VelociDeepEPPrepareAndFinalize(
+                num_dispatchers=all2all_manager.world_size,
+                is_sequence_parallel=(
+                    moe.moe_parallel_config.is_sequence_parallel
+                ),
+            )
 
     return prepare_finalize

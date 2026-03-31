@@ -48,6 +48,7 @@ All2AllBackend = Literal[
     "flashinfer_all2allv",  # temporary alias for flashinfer_nvlink_two_sided
     "flashinfer_nvlink_two_sided",
     "flashinfer_nvlink_one_sided",
+    "veloci_deepep",
 ]
 
 
@@ -168,7 +169,8 @@ class ParallelConfig:
     - "mori": Use mori kernels\n
     - "nixl_ep": Use nixl-ep kernels\n
     - "flashinfer_nvlink_two_sided": Use flashinfer two-sided kernels for mnnvl
-    - "flashinfer_nvlink_one_sided": Use flashinfer high-throughput a2a kernels"""
+    - "flashinfer_nvlink_one_sided": Use flashinfer high-throughput a2a kernels
+    - "veloci_deepep": Use VelociDeepEP with VelociGDA (fallback: oneCCL all2all)"""
 
     max_parallel_loading_workers: int | None = None
     """Maximum number of parallel loading workers when loading model

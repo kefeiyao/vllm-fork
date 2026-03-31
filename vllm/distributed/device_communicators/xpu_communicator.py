@@ -35,6 +35,26 @@ class XpuCommunicator(DeviceCommunicatorBase):
                 self.all2all_manager = AgRsAll2AllManager(self.cpu_group)
                 logger.info("Using AgRs manager on XPU device.")
 
+            elif self.all2all_backend == "veloci_deepep":
+                from vllm.utils.import_utils import has_veloci_deepep
+
+                if has_veloci_deepep():
+                    from .all2all import VelociDeepEPAll2AllManager
+
+                    self.all2all_manager = VelociDeepEPAll2AllManager(
+                        self.cpu_group
+                    )
+                else:
+                    from .all2all import VelociDeepEPFallbackAll2AllManager
+
+                    self.all2all_manager = VelociDeepEPFallbackAll2AllManager(
+                        self.cpu_group
+                    )
+                logger.info(
+                    "Using %s manager on XPU device.",
+                    self.all2all_manager.__class__.__name__,
+                )
+
             else:  # type: ignore[has-type]
                 logger.warning(
                     "`%s` all2all manager is not supported on XPU. "

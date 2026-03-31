@@ -407,6 +407,11 @@ def has_deep_ep() -> bool:
     return _has_module("deep_ep")
 
 
+def has_veloci_deepep() -> bool:
+    """Whether the optional `veloci_deepep` package is available."""
+    return _has_module("veloci_deepep")
+
+
 def has_deep_gemm() -> bool:
     """Whether the optional `deep_gemm` package is available."""
     return _has_module("deep_gemm")

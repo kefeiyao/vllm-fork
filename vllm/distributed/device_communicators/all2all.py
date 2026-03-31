@@ -14,7 +14,7 @@ from vllm.utils.flashinfer import (
     has_flashinfer_nvlink_one_sided,
     has_flashinfer_nvlink_two_sided,
 )
-from vllm.utils.import_utils import has_deep_ep, has_mori
+from vllm.utils.import_utils import has_deep_ep, has_mori, has_veloci_deepep
 
 from .base_device_communicator import All2AllManagerBase, Cache
 
@@ -850,3 +850,352 @@ class MoriAll2AllManager(All2AllManagerBase):
             mori_kwargs, self._make_handle
         )
         return handle
+
+
+class VelociDeepEPFallbackAll2AllManager(All2AllManagerBase):
+    """
+    Fallback All2All manager for VelociDeepEP.
+
+    Two modes, controlled by VLLM_VELOCI_DEEPEP_USE_A2A env var:
+      - AG-RS (default): allgather dispatch + reduce-scatter combine,
+        using the same well-tested primitives as AgRsAll2AllManager.
+      - A2A (debug): uses torch.distributed.all_to_all for both
+        dispatch and combine.  Enable with VLLM_VELOCI_DEEPEP_USE_A2A=1.
+
+    When VLLM_VELOCI_DEEPEP_VERIFY_A2A=1 is set (implies A2A mode),
+    both paths run and results are compared for debugging.
+    """
+
+    def __init__(self, cpu_group, tcp_store_group=None):
+        super().__init__(cpu_group, tcp_store_group)
+        import os
+        self._verify = os.environ.get(
+            "VLLM_VELOCI_DEEPEP_VERIFY_A2A", "0") == "1"
+        self._use_a2a = self._verify or os.environ.get(
+            "VLLM_VELOCI_DEEPEP_USE_A2A", "0") == "1"
+        if self._use_a2a:
+            logger.info(
+                "VelociDeepEP fallback: using dist.all_to_all mode "
+                "(verify=%s)", self._verify)
+        else:
+            logger.info(
+                "VelociDeepEP fallback: using allgather/reduce_scatter mode")
+
+    # ------------------------------------------------------------------
+    # AG-RS path (default, known-correct)
+    # ------------------------------------------------------------------
+
+    def _agrs_dispatch(
+        self,
+        tensors: list[torch.Tensor],
+        sizes: list[int],
+        dist_group,
+    ) -> list[torch.Tensor]:
+        return dist_group.all_gatherv(tensors, dim=0, sizes=sizes)
+
+    def _agrs_combine(
+        self,
+        hidden_states: torch.Tensor,
+        sizes: list[int],
+        dist_group,
+    ) -> torch.Tensor:
+        return dist_group.reduce_scatterv(hidden_states, dim=0, sizes=sizes)
+
+    # ------------------------------------------------------------------
+    # A2A path (debug / experimental)
+    # Note: should_dp_pad=True guarantees uniform sizes across ranks,
+    # so all tensors have the same dim-0 size. No padding needed.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _a2a_gather_single(
+        tensor: torch.Tensor,
+        sizes: list[int],
+        group,
+    ) -> torch.Tensor:
+        """Allgather one tensor via equal-size dist.all_to_all."""
+        world_size = len(sizes)
+        input_list = [tensor.clone() for _ in range(world_size)]
+        output_list = [
+            torch.empty_like(tensor) for _ in range(world_size)
+        ]
+        dist.all_to_all(output_list, input_list, group=group)
+        return torch.cat(output_list, dim=0)
+
+    def _a2a_dispatch(
+        self,
+        tensors: list[torch.Tensor],
+        sizes: list[int],
+        group,
+    ) -> list[torch.Tensor]:
+        results = []
+        for t in tensors:
+            results.append(self._a2a_gather_single(t, sizes, group))
+        return results
+
+    def _a2a_combine(
+        self,
+        hidden_states: torch.Tensor,
+        sizes: list[int],
+        dist_group,
+        group,
+    ) -> torch.Tensor:
+        """Reduce-scatter via equal-size dist.all_to_all + sum."""
+        world_size = dist_group.world_size
+        chunk_size = sizes[dist_group.rank_in_group]
+
+        raw_chunks = list(hidden_states.split(sizes, dim=0))
+        output_list = [
+            torch.empty_like(raw_chunks[0])
+            for _ in range(world_size)
+        ]
+        dist.all_to_all(output_list, raw_chunks, group=group)
+
+        return torch.stack(output_list).sum(dim=0)
+
+    # ------------------------------------------------------------------
+    # Verification helper
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _verify_close(name: str, a: torch.Tensor, b: torch.Tensor):
+        if a.shape != b.shape:
+            logger.error(
+                "VERIFY %s: shape mismatch: a2a=%s agrs=%s",
+                name, a.shape, b.shape)
+            return
+        a_f, b_f = a.float(), b.float()
+        maxdiff = (a_f - b_f).abs().max().item()
+        if maxdiff > 0:
+            num_diff = int((a_f != b_f).sum().item())
+            logger.error(
+                "VERIFY %s: dtype=%s shape=%s max_diff=%e "
+                "num_diff=%d/%d  a2a_first5=%s agrs_first5=%s",
+                name, a.dtype, list(a.shape), maxdiff,
+                num_diff, a.numel(),
+                a.flatten()[:5].tolist(),
+                b.flatten()[:5].tolist())
+        else:
+            logger.info("VERIFY %s: OK dtype=%s shape=%s", name, a.dtype,
+                        list(a.shape))
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        is_sequence_parallel: bool = False,
+        extra_tensors: list[torch.Tensor] | None = None,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
+    ):
+        dp_metadata = get_forward_context().dp_metadata
+        assert dp_metadata is not None
+        sizes = dp_metadata.get_chunk_sizes_across_dp_rank()
+        assert sizes is not None
+        dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
+        assert sizes[dist_group.rank_in_group] == hidden_states.shape[0]
+
+        tensors = [hidden_states, topk_weights, topk_ids]
+        if extra_tensors is not None:
+            tensors.extend(extra_tensors)
+
+        if self._verify:
+            # Run both paths and compare
+            logger.info(
+                "VERIFY dispatch: sizes=%s dtypes=%s shapes=%s",
+                sizes,
+                [t.dtype for t in tensors],
+                [list(t.shape) for t in tensors])
+            agrs_result = self._agrs_dispatch(
+                tensors, sizes, dist_group)
+            a2a_result = self._a2a_dispatch(
+                tensors, sizes, dist_group.device_group)
+            names = ["hidden_states", "topk_weights", "topk_ids"] + [
+                f"extra_{i}" for i in range(len(extra_tensors or []))]
+            for name, a, b in zip(names, a2a_result, agrs_result):
+                self._verify_close(f"dispatch/{name}", a, b)
+            # Use AG-RS result (known correct)
+            gathered = agrs_result
+        elif self._use_a2a:
+            gathered = self._a2a_dispatch(
+                tensors, sizes, dist_group.device_group)
+        else:
+            gathered = self._agrs_dispatch(tensors, sizes, dist_group)
+
+        hidden_states = gathered[0]
+        topk_weights = gathered[1]
+        topk_ids = gathered[2]
+
+        if extra_tensors is None:
+            return hidden_states, topk_weights, topk_ids
+        return hidden_states, topk_weights, topk_ids, gathered[3:]
+
+    def dispatch_router_logits(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        is_sequence_parallel: bool = False,
+        extra_tensors: list[torch.Tensor] | None = None,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]
+    ):
+        dp_metadata = get_forward_context().dp_metadata
+        assert dp_metadata is not None
+        sizes = dp_metadata.get_chunk_sizes_across_dp_rank()
+        assert sizes is not None
+        dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
+        assert sizes[dist_group.rank_in_group] == hidden_states.shape[0]
+
+        tensors = [hidden_states, router_logits]
+        if extra_tensors is not None:
+            tensors.extend(extra_tensors)
+
+        if self._verify:
+            agrs_result = self._agrs_dispatch(
+                tensors, sizes, dist_group)
+            a2a_result = self._a2a_dispatch(
+                tensors, sizes, dist_group.device_group)
+            names = ["hidden_states", "router_logits"] + [
+                f"extra_{i}" for i in range(len(extra_tensors or []))]
+            for name, a, b in zip(names, a2a_result, agrs_result):
+                self._verify_close(f"dispatch_router/{name}", a, b)
+            gathered = agrs_result
+        elif self._use_a2a:
+            gathered = self._a2a_dispatch(
+                tensors, sizes, dist_group.device_group)
+        else:
+            gathered = self._agrs_dispatch(tensors, sizes, dist_group)
+
+        if extra_tensors is not None:
+            return (gathered[0], gathered[1], gathered[2:])
+        return gathered[0], gathered[1]
+
+    def combine(
+        self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
+    ) -> torch.Tensor:
+        dp_metadata = get_forward_context().dp_metadata
+        assert dp_metadata is not None
+        sizes = dp_metadata.get_chunk_sizes_across_dp_rank()
+        assert sizes is not None
+
+        dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
+
+        if self._verify:
+            agrs_out = self._agrs_combine(
+                hidden_states, sizes, dist_group)
+            a2a_out = self._a2a_combine(
+                hidden_states, sizes, dist_group,
+                dist_group.device_group)
+            self._verify_close("combine/hidden_states", a2a_out, agrs_out)
+            return agrs_out
+        elif self._use_a2a:
+            return self._a2a_combine(
+                hidden_states, sizes, dist_group,
+                dist_group.device_group)
+        else:
+            return self._agrs_combine(hidden_states, sizes, dist_group)
+
+    def destroy(self):
+        pass
+
+
+class VelociDeepEPAll2AllManager(All2AllManagerBase):
+    """
+    All2All manager for VelociDeepEP using veloci_deepep.Buffer
+    in low-latency mode (same API as DeepEPLLAll2AllManager).
+
+    The Buffer is created here and passed to VelociDeepEPPrepareAndFinalize
+    which drives the actual low_latency_dispatch/combine calls.
+
+    dispatch/combine/dispatch_router_logits on this manager raise
+    NotImplementedError because the PrepareAndFinalize class calls
+    buffer.low_latency_dispatch/combine directly.
+    """
+
+    def __init__(self, cpu_group, tcp_store_group=None):
+        assert has_veloci_deepep(), (
+            "veloci_deepep package not found. "
+            "Please install veloci_deepep to use the VelociDeepEP backend."
+        )
+        super().__init__(cpu_group, tcp_store_group)
+        self.handle_cache = Cache()
+
+    def _make_all2all_kwargs(
+        self,
+        max_num_tokens_per_dp_rank: int,
+        token_hidden_size: int,
+        num_ep_ranks: int,
+        num_global_experts: int,
+        num_local_experts: int,
+    ) -> dict[Any, Any]:
+        import veloci_deepep  # type: ignore[import-not-found]
+
+        num_nvl_bytes = envs.VLLM_DEEPEP_BUFFER_SIZE_MB * 1024 * 1024
+        num_qps_per_rank = num_local_experts
+        num_rdma_bytes = veloci_deepep.Buffer.get_low_latency_rdma_size_hint(
+            num_max_dispatch_tokens_per_rank=max_num_tokens_per_dp_rank,
+            hidden=token_hidden_size,
+            num_ranks=num_ep_ranks,
+            num_experts=num_global_experts,
+        )
+
+        assert num_rdma_bytes is not None
+        return dict(
+            group=self.cpu_group,
+            num_nvl_bytes=num_nvl_bytes,
+            num_rdma_bytes=num_rdma_bytes,
+            low_latency_mode=True,
+            num_qps_per_rank=num_qps_per_rank,
+            allow_nvlink_for_low_latency_mode=True,
+            allow_mnnvl=envs.VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL,
+            explicitly_destroy=True,
+        )
+
+    def get_handle(self, kwargs):
+        import veloci_deepep  # type: ignore[import-not-found]
+
+        buffer_kwargs = self._make_all2all_kwargs(**kwargs)
+        logger.debug("VelociDeepEP all2all args %s", buffer_kwargs)
+        handle: veloci_deepep.Buffer = self.handle_cache.get_or_create(
+            buffer_kwargs, veloci_deepep.Buffer
+        )
+        return handle
+
+    # VelociDeepEP LL uses RDMA so no SMs are used for communication.
+    def max_sms_used(self) -> int | None:
+        return 0
+
+    def dispatch(self, hidden_states, topk_weights, topk_ids,
+                 is_sequence_parallel=False, extra_tensors=None):
+        raise NotImplementedError(
+            "VelociDeepEPAll2AllManager.dispatch() should not be called "
+            "directly. VelociDeepEPPrepareAndFinalize calls "
+            "buffer.low_latency_dispatch."
+        )
+
+    def dispatch_router_logits(self, hidden_states, router_logits,
+                               is_sequence_parallel=False, extra_tensors=None):
+        raise NotImplementedError(
+            "VelociDeepEPAll2AllManager.dispatch_router_logits() should not "
+            "be called directly."
+        )
+
+    def combine(self, hidden_states, is_sequence_parallel=False):
+        raise NotImplementedError(
+            "VelociDeepEPAll2AllManager.combine() should not be called "
+            "directly. VelociDeepEPPrepareAndFinalize calls "
+            "buffer.low_latency_combine."
+        )
+
+    def destroy(self):
+        with self.handle_cache._lock:
+            for _, handle in self.handle_cache._cache.items():
+                handle.destroy()
+            self.handle_cache._cache.clear()
