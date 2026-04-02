@@ -321,6 +321,10 @@ def maybe_make_prepare_finalize(
                 local_expert_global_ids=local_expert_global_ids,
             )
         else:
+            all_to_all_args = dict(
+                num_experts=moe.num_experts,
+            )
+            all2all_manager.get_handle(all_to_all_args)
             prepare_finalize = VelociDeepEPPrepareAndFinalize(
                 num_dispatchers=all2all_manager.world_size,
                 is_sequence_parallel=(

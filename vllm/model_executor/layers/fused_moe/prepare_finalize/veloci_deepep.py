@@ -478,7 +478,6 @@ class VelociDeepEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         a1q, a1q_scale, scales = self._fallback_quantize_input(
             a1, quant_config, defer_input_quant
         )
-        print(f"rank<{torch.distributed.get_rank()}>: Fallback dispatch: a1q.shape={a1q.shape}, topk_weights.shape={topk_weights.shape}, topk_ids.shape={topk_ids.shape}, a1q_scale.shape={a1q_scale.shape if a1q_scale is not None else None}")
         res = get_ep_group().dispatch(
             a1q,
             topk_weights,
@@ -496,7 +495,6 @@ class VelociDeepEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         def receiver() -> mk.PrepareResultType:
             return a1q, a1q_scale, None, topk_ids, topk_weights
 
-        print(f"rank<{torch.distributed.get_rank()}>: Finished fallback dispatch, returning receiver with a1q.shape={a1q.shape}, topk_weights.shape={topk_weights.shape}, topk_ids.shape={topk_ids.shape}, a1q_scale.shape={a1q_scale.shape if a1q_scale is not None else None}")
         return receiver
 
     def _fallback_finalize(

@@ -36,12 +36,24 @@ class XpuCommunicator(DeviceCommunicatorBase):
                 logger.info("Using AgRs manager on XPU device.")
 
             elif self.all2all_backend == "veloci_deepep":
+                import os
+
                 from vllm.utils.import_utils import has_veloci_deepep
+
+                use_agrs = os.environ.get(
+                    "VLLM_VELOCI_DEEPEP_USE_AGRS", "0"
+                ) == "1"
 
                 if has_veloci_deepep():
                     from .all2all import VelociDeepEPAll2AllManager
 
                     self.all2all_manager = VelociDeepEPAll2AllManager(
+                        self.cpu_group
+                    )
+                elif use_agrs:
+                    from .all2all import VelociDeepEPFallbackAGRSManager
+
+                    self.all2all_manager = VelociDeepEPFallbackAGRSManager(
                         self.cpu_group
                     )
                 else:

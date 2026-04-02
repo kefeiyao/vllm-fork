@@ -209,7 +209,6 @@ class AgRsAll2AllManager(All2AllManagerBase):
         assert sizes is not None
         dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
         assert sizes[dist_group.rank_in_group] == hidden_states.shape[0]
-
         tensors_to_gather = [hidden_states, topk_weights, topk_ids]
         if extra_tensors is not None:
             tensors_to_gather.extend(extra_tensors)
@@ -854,134 +853,237 @@ class MoriAll2AllManager(All2AllManagerBase):
 
 class VelociDeepEPFallbackAll2AllManager(All2AllManagerBase):
     """
-    Fallback All2All manager for VelociDeepEP.
+    True routing-based all-to-all for MoE expert parallelism.
 
-    Two modes, controlled by VLLM_VELOCI_DEEPEP_USE_A2A env var:
-      - AG-RS (default): allgather dispatch + reduce-scatter combine,
-        using the same well-tested primitives as AgRsAll2AllManager.
-      - A2A (debug): uses torch.distributed.all_to_all for both
-        dispatch and combine.  Enable with VLLM_VELOCI_DEEPEP_USE_A2A=1.
+    Each token is sent only to the EP ranks whose local experts are
+    selected by the router.  Different ranks exchange different numbers
+    of tokens (variable-size all-to-all).
 
-    When VLLM_VELOCI_DEEPEP_VERIFY_A2A=1 is set (implies A2A mode),
-    both paths run and results are compared for debugging.
+    Communication uses ``dist.all_to_all_single`` for both count exchange
+    and data exchange.  State from ``dispatch()`` (routing metadata) is
+    kept in ``_state`` for use by ``combine()``.
+
+    Note: ``dist.all_to_all_single`` may be broken on certain backends
+    (e.g. XCCL sub-groups on Intel XPU).  This manager is the
+    *reference* implementation; use the AGRS fallback if the backend
+    has known all_to_all issues.
     """
 
     def __init__(self, cpu_group, tcp_store_group=None):
         super().__init__(cpu_group, tcp_store_group)
-        import os
-        self._verify = os.environ.get(
-            "VLLM_VELOCI_DEEPEP_VERIFY_A2A", "0") == "1"
-        self._use_a2a = self._verify or os.environ.get(
-            "VLLM_VELOCI_DEEPEP_USE_A2A", "0") == "1"
-        if self._use_a2a:
-            logger.info(
-                "VelociDeepEP fallback: using dist.all_to_all mode "
-                "(verify=%s)", self._verify)
-        else:
-            logger.info(
-                "VelociDeepEP fallback: using allgather/reduce_scatter mode")
+        print(f"Using velocideep fallback All2All (oneccl) manager. This may be slow...")  # noqa
+        # Routing metadata carried from dispatch → combine.
+        self._state: dict | None = None
+        # Set via get_handle() before first dispatch.
+        self._num_local_experts: int = 0
 
-    # ------------------------------------------------------------------
-    # AG-RS path (default, known-correct)
-    # ------------------------------------------------------------------
-
-    def _agrs_dispatch(
-        self,
-        tensors: list[torch.Tensor],
-        sizes: list[int],
-        dist_group,
-    ) -> list[torch.Tensor]:
-        return dist_group.all_gatherv(tensors, dim=0, sizes=sizes)
-
-    def _agrs_combine(
-        self,
-        hidden_states: torch.Tensor,
-        sizes: list[int],
-        dist_group,
-    ) -> torch.Tensor:
-        return dist_group.reduce_scatterv(hidden_states, dim=0, sizes=sizes)
-
-    # ------------------------------------------------------------------
-    # A2A path (debug / experimental)
-    # Note: should_dp_pad=True guarantees uniform sizes across ranks,
-    # so all tensors have the same dim-0 size. No padding needed.
-    # ------------------------------------------------------------------
+    def get_handle(self, kwargs):
+        """Store model-specific config (num_experts)."""
+        num_experts = kwargs.get("num_experts", 0)
+        if num_experts > 0:
+            self._num_local_experts = (
+                num_experts // self.world_size
+            )
+        return self
 
     @staticmethod
-    def _a2a_gather_single(
-        tensor: torch.Tensor,
-        sizes: list[int],
+    def _a2a_exchange(
+        send_tensor: torch.Tensor,
+        send_counts: list[int],
+        recv_counts: list[int],
         group,
     ) -> torch.Tensor:
-        """Allgather one tensor via equal-size dist.all_to_all."""
-        world_size = len(sizes)
-        input_list = [tensor.clone() for _ in range(world_size)]
-        output_list = [
-            torch.empty_like(tensor) for _ in range(world_size)
-        ]
-        dist.all_to_all(output_list, input_list, group=group)
-        return torch.cat(output_list, dim=0)
+        """Variable-size exchange via dist.all_to_all_single."""
+        total_recv = sum(recv_counts)
+        total_send = sum(send_counts)
+        row_shape = send_tensor.shape[1:]
+        # Compute elements-per-row from tensor shape (not from numel ratio,
+        # which breaks when shape[0]==0).
+        cols = 1
+        for s in row_shape:
+            cols *= s
+        if total_send == 0 and total_recv == 0:
+            return torch.empty(
+                [0] + list(row_shape),
+                dtype=send_tensor.dtype, device=send_tensor.device,
+            )
+        flat_send = send_tensor.reshape(-1)
+        send_splits = [c * cols for c in send_counts]
+        recv_splits = [c * cols for c in recv_counts]
+        flat_recv = torch.empty(
+            sum(recv_splits),
+            dtype=send_tensor.dtype, device=send_tensor.device,
+        )
+        dist.all_to_all_single(
+            flat_recv, flat_send,
+            output_split_sizes=recv_splits,
+            input_split_sizes=send_splits,
+            group=group,
+        )
+        return flat_recv.reshape([total_recv] + list(row_shape))
 
-    def _a2a_dispatch(
-        self,
-        tensors: list[torch.Tensor],
-        sizes: list[int],
-        group,
-    ) -> list[torch.Tensor]:
-        results = []
-        for t in tensors:
-            results.append(self._a2a_gather_single(t, sizes, group))
-        return results
-
-    def _a2a_combine(
+    def dispatch(
         self,
         hidden_states: torch.Tensor,
-        sizes: list[int],
-        dist_group,
-        group,
-    ) -> torch.Tensor:
-        """Reduce-scatter via equal-size dist.all_to_all + sum."""
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        is_sequence_parallel: bool = False,
+        extra_tensors: list[torch.Tensor] | None = None,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
+    ):
+        """Route tokens to EP ranks based on expert assignment."""
+        dist_group = (
+            get_ep_group() if is_sequence_parallel else get_dp_group()
+        )
         world_size = dist_group.world_size
-        chunk_size = sizes[dist_group.rank_in_group]
+        group = dist_group.device_group
+        my_rank = dist_group.rank_in_group
+        num_local_experts = self._num_local_experts
+        assert num_local_experts > 0, (
+            "VelociDeepEPFallbackAll2AllManager: num_local_experts not set. "
+            "Call get_handle({'num_experts': N}) first."
+        )
+        num_tokens = hidden_states.shape[0]
+        # print(f"{topk_ids.shape=},{topk_ids=}")
+        # --- Determine destination ranks ---
+        expert_to_rank = topk_ids.clamp(min=0) // num_local_experts
+        valid_mask = topk_ids >= 0
 
-        raw_chunks = list(hidden_states.split(sizes, dim=0))
-        output_list = [
-            torch.empty_like(raw_chunks[0])
-            for _ in range(world_size)
-        ]
-        dist.all_to_all(output_list, raw_chunks, group=group)
+        dest_mask = torch.zeros(
+            num_tokens, world_size, dtype=torch.bool,
+            device=hidden_states.device,
+        )
+        for r in range(world_size):
+            dest_mask[:, r] = (
+                (expert_to_rank == r) & valid_mask
+            ).any(dim=1)
+        # print(f"{dest_mask.shape=},{dest_mask=}")
+        # Per-rank send token indices.
+        send_token_indices: list[torch.Tensor] = []
+        for r in range(world_size):
+            send_token_indices.append(
+                dest_mask[:, r].nonzero(as_tuple=True)[0]
+            )
+        send_counts = [idx.shape[0] for idx in send_token_indices]
+        # print(f"{send_counts}")
+        # print(f"{hidden_states=}")
+        # --- Exchange counts via all_gather ---
+        send_counts_t = torch.tensor(
+            send_counts, dtype=torch.int64, device=hidden_states.device,
+        )
+        # print(f"{send_counts_t=}")
+        all_counts = dist_group.all_gatherv(
+            send_counts_t, dim=0,
+            sizes=[send_counts_t.shape[0]] * world_size,
+        )
+        # Shape: [world_size * world_size]. Reshape to matrix.
+        all_counts = all_counts.reshape(world_size, world_size)
+        # recv_count from rank r = rank r's send count to us (column my_rank).
+        # print(f"{all_counts=}")
+        recv_counts = all_counts[:, my_rank].tolist()
 
-        return torch.stack(output_list).sum(dim=0)
-
-    # ------------------------------------------------------------------
-    # Verification helper
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _verify_close(name: str, a: torch.Tensor, b: torch.Tensor):
-        if a.shape != b.shape:
-            logger.error(
-                "VERIFY %s: shape mismatch: a2a=%s agrs=%s",
-                name, a.shape, b.shape)
-            return
-        a_f, b_f = a.float(), b.float()
-        maxdiff = (a_f - b_f).abs().max().item()
-        if maxdiff > 0:
-            num_diff = int((a_f != b_f).sum().item())
-            logger.error(
-                "VERIFY %s: dtype=%s shape=%s max_diff=%e "
-                "num_diff=%d/%d  a2a_first5=%s agrs_first5=%s",
-                name, a.dtype, list(a.shape), maxdiff,
-                num_diff, a.numel(),
-                a.flatten()[:5].tolist(),
-                b.flatten()[:5].tolist())
+        # --- Gather tokens ordered by destination rank ---
+        if sum(send_counts) > 0:
+            send_indices = torch.cat(send_token_indices)
         else:
-            logger.info("VERIFY %s: OK dtype=%s shape=%s", name, a.dtype,
-                        list(a.shape))
+            send_indices = torch.empty(
+                0, dtype=torch.long, device=hidden_states.device,
+            )
 
-    # ------------------------------------------------------------------
-    # Public interface
-    # ------------------------------------------------------------------
+        send_hs = hidden_states[send_indices]
+        send_tw = topk_weights[send_indices]
+        send_ti = topk_ids[send_indices]
+
+        # print(f"{send_hs=},{send_counts=},{recv_counts=},{send_tw=},{send_ti=}")
+    
+        # --- Exchange data ---
+        recv_hs = self._a2a_exchange(send_hs, send_counts, recv_counts, group)
+        recv_tw = self._a2a_exchange(send_tw, send_counts, recv_counts, group)
+        recv_ti = self._a2a_exchange(send_ti, send_counts, recv_counts, group)
+
+
+        recv_extra: list[torch.Tensor] | None = None
+        if extra_tensors is not None:
+            recv_extra = []
+            for t in extra_tensors:
+                send_t = t[send_indices]
+                recv_extra.append(
+                    self._a2a_exchange(
+                        send_t, send_counts, recv_counts, group,
+                    )
+                )
+
+        # Save state for combine.
+        self._state = {
+            "send_counts": send_counts,
+            "recv_counts": recv_counts,
+            "send_token_indices": send_token_indices,
+            "num_tokens": num_tokens,
+            "group": group,
+        }
+
+        if recv_extra is None:
+            return recv_hs, recv_tw, recv_ti
+        return recv_hs, recv_tw, recv_ti, recv_extra
+
+    def combine(
+        self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
+    ) -> torch.Tensor:
+        """Reverse the dispatch routing and sum partial results."""
+        state = self._state
+        assert state is not None, (
+            "VelociDeepEPFallbackAll2AllManager.combine() called without prior dispatch()"
+        )
+        self._state = None
+
+        # Reverse: during dispatch we received recv_counts[r] from rank r,
+        # now we send those results back.
+        comb_send_counts = state["recv_counts"]
+        comb_recv_counts = state["send_counts"]
+        group = state["group"]
+        num_tokens = state["num_tokens"]
+        send_token_indices = state["send_token_indices"]
+
+        recv_results = self._a2a_exchange(
+            hidden_states.contiguous(),
+            comb_send_counts, comb_recv_counts, group,
+        )
+
+        hidden_dim = hidden_states.shape[-1]
+        result = torch.zeros(
+            [num_tokens, hidden_dim],
+            dtype=hidden_states.dtype, device=hidden_states.device,
+        )
+        offset = 0
+        for r in range(len(comb_recv_counts)):
+            count = comb_recv_counts[r]
+            if count > 0:
+                result.index_add_(
+                    0, send_token_indices[r],
+                    recv_results[offset:offset + count],
+                )
+                offset += count
+
+        return result
+
+    def destroy(self):
+        pass
+
+
+class VelociDeepEPFallbackAGRSManager(All2AllManagerBase):
+    """
+    Fallback All2All manager for VelociDeepEP (AGRS path).
+
+    Uses allgather (dispatch) + reduce-scatter (combine), the same
+    well-tested primitives as AgRsAll2AllManager.  This manager is
+    used when VLLM_VELOCI_DEEPEP_USE_AGRS=1 is set.
+    """
+
+    def __init__(self, cpu_group, tcp_store_group=None):
+        print(f"Using velocideep fallback AGRS (oneccl) manager. This may be slow...")
+        super().__init__(cpu_group, tcp_store_group)
 
     def dispatch(
         self,
@@ -1000,37 +1102,44 @@ class VelociDeepEPFallbackAll2AllManager(All2AllManagerBase):
         assert sizes is not None
         dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
         assert sizes[dist_group.rank_in_group] == hidden_states.shape[0]
-
         tensors = [hidden_states, topk_weights, topk_ids]
         if extra_tensors is not None:
             tensors.extend(extra_tensors)
 
-        if self._verify:
-            # Run both paths and compare
-            logger.info(
-                "VERIFY dispatch: sizes=%s dtypes=%s shapes=%s",
-                sizes,
-                [t.dtype for t in tensors],
-                [list(t.shape) for t in tensors])
-            agrs_result = self._agrs_dispatch(
-                tensors, sizes, dist_group)
-            a2a_result = self._a2a_dispatch(
-                tensors, sizes, dist_group.device_group)
-            names = ["hidden_states", "topk_weights", "topk_ids"] + [
-                f"extra_{i}" for i in range(len(extra_tensors or []))]
-            for name, a, b in zip(names, a2a_result, agrs_result):
-                self._verify_close(f"dispatch/{name}", a, b)
-            # Use AG-RS result (known correct)
-            gathered = agrs_result
-        elif self._use_a2a:
-            gathered = self._a2a_dispatch(
-                tensors, sizes, dist_group.device_group)
-        else:
-            gathered = self._agrs_dispatch(tensors, sizes, dist_group)
+        # for t in tensors:
+        #     print(f"{t.shape=},{t.dtype=}")
+        # print(f"{sizes=}")
+        gathered = dist_group.all_gatherv(tensors, dim=0, sizes=sizes)
+
+        # --- Diagnostic: test tiny all_gatherv in the same env where AGRS works ---
+
+        my_rank = dist_group.rank_in_group
+        ws = dist_group.world_size
+        # Test 1: tiny tensor, variable sizes (same as AGRS uses)
+        tiny = torch.tensor([my_rank * 10 + 1, my_rank * 10 + 2],
+                            dtype=torch.int64, device=hidden_states.device)
+        tiny_sizes = [2] * ws  # equal sizes
+        tiny_result = dist_group.all_gatherv(tiny, dim=0, sizes=tiny_sizes)
+        tiny_expected = torch.cat([
+            torch.tensor([r * 10 + 1, r * 10 + 2],
+                         dtype=torch.int64, device=hidden_states.device)
+            for r in range(ws)
+        ])
+        ok1 = torch.equal(tiny_result, tiny_expected)
+        # Test 2: tiny tensor, no sizes (triggers equal-size path)
+        tiny2 = torch.tensor([my_rank * 10 + 1, my_rank * 10 + 2],
+                             dtype=torch.int64, device=hidden_states.device)
+        tiny_result2 = dist_group.all_gatherv(tiny2, dim=0)
+        ok2 = torch.equal(tiny_result2, tiny_expected)
+        # print(f"[AGRS DIAG rank={my_rank}] tiny all_gatherv with sizes: "
+        #       f"{'PASS' if ok1 else 'FAIL'} result={tiny_result}")
+        # print(f"[AGRS DIAG rank={my_rank}] tiny all_gatherv no sizes:   "
+        #       f"{'PASS' if ok2 else 'FAIL'} result={tiny_result2}")
 
         hidden_states = gathered[0]
         topk_weights = gathered[1]
         topk_ids = gathered[2]
+        # print(f"{topk_ids=},{topk_ids.shape=},{topk_ids.dtype=}")
 
         if extra_tensors is None:
             return hidden_states, topk_weights, topk_ids
@@ -1057,21 +1166,7 @@ class VelociDeepEPFallbackAll2AllManager(All2AllManagerBase):
         if extra_tensors is not None:
             tensors.extend(extra_tensors)
 
-        if self._verify:
-            agrs_result = self._agrs_dispatch(
-                tensors, sizes, dist_group)
-            a2a_result = self._a2a_dispatch(
-                tensors, sizes, dist_group.device_group)
-            names = ["hidden_states", "router_logits"] + [
-                f"extra_{i}" for i in range(len(extra_tensors or []))]
-            for name, a, b in zip(names, a2a_result, agrs_result):
-                self._verify_close(f"dispatch_router/{name}", a, b)
-            gathered = agrs_result
-        elif self._use_a2a:
-            gathered = self._a2a_dispatch(
-                tensors, sizes, dist_group.device_group)
-        else:
-            gathered = self._agrs_dispatch(tensors, sizes, dist_group)
+        gathered = dist_group.all_gatherv(tensors, dim=0, sizes=sizes)
 
         if extra_tensors is not None:
             return (gathered[0], gathered[1], gathered[2:])
@@ -1086,21 +1181,7 @@ class VelociDeepEPFallbackAll2AllManager(All2AllManagerBase):
         assert sizes is not None
 
         dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
-
-        if self._verify:
-            agrs_out = self._agrs_combine(
-                hidden_states, sizes, dist_group)
-            a2a_out = self._a2a_combine(
-                hidden_states, sizes, dist_group,
-                dist_group.device_group)
-            self._verify_close("combine/hidden_states", a2a_out, agrs_out)
-            return agrs_out
-        elif self._use_a2a:
-            return self._a2a_combine(
-                hidden_states, sizes, dist_group,
-                dist_group.device_group)
-        else:
-            return self._agrs_combine(hidden_states, sizes, dist_group)
+        return dist_group.reduce_scatterv(hidden_states, dim=0, sizes=sizes)
 
     def destroy(self):
         pass
