@@ -145,6 +145,20 @@ class XPUWorker(Worker):
             )
 
     def init_device(self):
+        # Adjust local_rank for DP (same approach as CUDA gpu_worker).
+        # Without per-device ZE_AFFINITY_MASK isolation, the XPU worker
+        # sees all devices and must index by DP rank * TP/PP world size.
+        parallel_config = self.parallel_config
+        if parallel_config.data_parallel_size > 1:
+            dp_local_rank = parallel_config.data_parallel_rank_local
+            if dp_local_rank is None:
+                dp_local_rank = parallel_config.data_parallel_index
+            tp_pp_world_size = (
+                parallel_config.pipeline_parallel_size
+                * parallel_config.tensor_parallel_size
+            )
+            self.local_rank += dp_local_rank * tp_pp_world_size
+
         # Bind CPU affinity and memory node before any allocations
         _bind_numa(self.local_rank)
 

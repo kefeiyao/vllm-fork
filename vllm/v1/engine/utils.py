@@ -136,8 +136,11 @@ class CoreEngineProcManager:
                 # Adjust device control in DP for non-CUDA platforms
                 # as well as external and ray launchers
                 # For CUDA platforms, we use torch.accelerator.set_device_index()()
+                # For XPU, skip env-var isolation — XPU workers adjust
+                # local_rank via set_device_index instead (like CUDA).
                 if is_dp and (
                     not current_platform.is_cuda_alike()
+                    and not current_platform.is_xpu()
                     or vllm_config.parallel_config.use_ray
                 ):
                     with set_device_control_env_var(vllm_config, local_dp_rank):
