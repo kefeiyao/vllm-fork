@@ -3,7 +3,7 @@
 #
 # Modes:
 #   --holistic            Single (non-disaggregated) vLLM server
-#   --prefill / --decode  Disaggregated prefill-decode instances (IPC via NIXL)
+#   --prefill / --decode  Disaggregated prefill-decode instances (NIXL via UCX IPC or verbs)
 #   --proxy               Disagg proxy server
 #   --kill                Kill all running vllm/proxy processes
 
@@ -52,6 +52,16 @@ MAX_MODEL_LEN=8192
 BLOCK_SIZE=64
 GPU_MEM_UTIL=0.8
 PROXY_PORT=8300
+NIXL_TRANSPORT="ipc"
+UCX_TLS_OVERRIDE=""
+UCX_NET_DEVICES=""
+SERVE_HOST="localhost"
+SIDE_CHANNEL_HOST="localhost"
+PROXY_HOST="localhost"
+PREFILL_BACKEND_HOST="localhost"
+PREFILL_BACKEND_PORT=8100
+DECODE_BACKEND_HOST="localhost"
+DECODE_BACKEND_PORT=8200
 
 # Side-channel ports (internal, per disagg mode)
 P_SIDE_CHANNEL_PORT=5577
@@ -88,6 +98,16 @@ Options:
       --block-size N       Block size (default: $BLOCK_SIZE)
       --gpu-mem-util F     GPU memory utilization (default: $GPU_MEM_UTIL)
   -n, --numa SPEC         NUMA binding (cpulist:memnode per rank, ';'-separated)
+      --serve-host HOST    Host/IP for vLLM API bind (default: $SERVE_HOST)
+      --nixl-transport MODE  Disagg NIXL transport preset: ipc|verbs (default: $NIXL_TRANSPORT)
+      --ucx-tls TLS         Advanced: override the resolved UCX_TLS for disagg mode
+      --ucx-net-devices DEV UCX_NET_DEVICES for disagg mode (default: auto; verbs=all)
+      --side-channel-host H Host/IP advertised for NIXL side-channel (default: $SIDE_CHANNEL_HOST)
+      --proxy-host HOST    Host/IP for proxy bind (default: $PROXY_HOST, with --proxy)
+      --prefill-backend-host H  Proxy upstream prefiller host (default: $PREFILL_BACKEND_HOST)
+      --prefill-backend-port P  Proxy upstream prefiller port (default: $PREFILL_BACKEND_PORT)
+      --decode-backend-host H   Proxy upstream decoder host (default: $DECODE_BACKEND_HOST)
+      --decode-backend-port P   Proxy upstream decoder port (default: $DECODE_BACKEND_PORT)
       --proxy-port PORT    Proxy listen port (default: $PROXY_PORT, with --proxy)
   -h, --help              Show this help
 
@@ -103,8 +123,15 @@ Examples:
   # Prefill: TP=4 on GPUs 0-3
   $0 --prefill -m \$model -t 4 -e -b FLASH_ATTN -d 0,1,2,3 -q fp8 --dtype bfloat16
 
+    # Prefill over UCX verbs on a multi-host setup
+    $0 --prefill --serve-host 0.0.0.0 --side-channel-host <prefill_ip> \
+         --nixl-transport verbs --ucx-net-devices all -m \$model -t 4 -d 0,1,2,3
+
   # Decode: TP=1, DP=4, veloci_deepep on GPUs 4-7
   $0 --decode -m \$model -t 1 --dp 4 -e -d 4,5,6,7 -q fp8 -a veloci_deepep --dtype bfloat16
+
+    # Proxy for remote prefill/decode backends
+    $0 --proxy --proxy-host 0.0.0.0 --prefill-backend-host <prefill_ip> --decode-backend-host <decode_ip>
 
   # Proxy (with wait for backends)
   $0 --proxy --wait
@@ -144,6 +171,16 @@ while [[ $# -gt 0 ]]; do
         --block-size)      BLOCK_SIZE="$2"; shift 2 ;;
         --gpu-mem-util)    GPU_MEM_UTIL="$2"; shift 2 ;;
         -n|--numa)         NUMA_CONTROL="$2"; shift 2 ;;
+        --serve-host)      SERVE_HOST="$2"; shift 2 ;;
+        --nixl-transport)  NIXL_TRANSPORT="$2"; shift 2 ;;
+        --ucx-tls)         UCX_TLS_OVERRIDE="$2"; shift 2 ;;
+        --ucx-net-devices) UCX_NET_DEVICES="$2"; shift 2 ;;
+        --side-channel-host) SIDE_CHANNEL_HOST="$2"; shift 2 ;;
+        --proxy-host)      PROXY_HOST="$2"; shift 2 ;;
+        --prefill-backend-host) PREFILL_BACKEND_HOST="$2"; shift 2 ;;
+        --prefill-backend-port) PREFILL_BACKEND_PORT="$2"; shift 2 ;;
+        --decode-backend-host) DECODE_BACKEND_HOST="$2"; shift 2 ;;
+        --decode-backend-port) DECODE_BACKEND_PORT="$2"; shift 2 ;;
         --proxy-port)      PROXY_PORT="$2"; shift 2 ;;
 
         -h|--help)         usage ;;
@@ -169,8 +206,8 @@ fi
 
 # ── Proxy mode ──
 if [[ "$MODE" == "proxy" ]]; then
-    P_URL="http://localhost:8100/health"
-    D_URL="http://localhost:8200/health"
+    P_URL="http://${PREFILL_BACKEND_HOST}:${PREFILL_BACKEND_PORT}/health"
+    D_URL="http://${DECODE_BACKEND_HOST}:${DECODE_BACKEND_PORT}/health"
 
     if [[ "$PROXY_WAIT" -eq 1 ]]; then
         echo "Waiting for prefill ($P_URL) and decode ($D_URL) to become ready..."
@@ -198,11 +235,11 @@ if [[ "$MODE" == "proxy" ]]; then
 
     PROXY_LOG="$LOG_DIR/proxy.log"
     rotate_log "$PROXY_LOG"
-    echo "Starting PROXY on port $PROXY_PORT (prefill=8100, decode=8200)"
+    echo "Starting PROXY on ${PROXY_HOST}:$PROXY_PORT (prefill=${PREFILL_BACKEND_HOST}:${PREFILL_BACKEND_PORT}, decode=${DECODE_BACKEND_HOST}:${DECODE_BACKEND_PORT})"
     python3 /host/mnt/ctrl/disk1/kf/vllm/tests/v1/kv_connector/nixl_integration/toy_proxy_server.py \
-        --prefiller-host localhost --prefiller-port 8100 \
-        --decoder-host localhost --decoder-port 8200 \
-        --host localhost --port "$PROXY_PORT" \
+        --prefiller-host "$PREFILL_BACKEND_HOST" --prefiller-port "$PREFILL_BACKEND_PORT" \
+        --decoder-host "$DECODE_BACKEND_HOST" --decoder-port "$DECODE_BACKEND_PORT" \
+        --host "$PROXY_HOST" --port "$PROXY_PORT" \
         >>"$PROXY_LOG" 2>&1 &
     echo "  PID=$!, log=$PROXY_LOG"
     exit 0
@@ -256,6 +293,15 @@ case "$ATTN_BACKEND" in
     *) echo "Error: --attn-backend must be one of: FLASH_ATTN, TRITON_ATTN, TORCH_SDPA (got: $ATTN_BACKEND)"; exit 1 ;;
 esac
 
+case "$NIXL_TRANSPORT" in
+    ipc|verbs) ;;
+    *) echo "Error: --nixl-transport must be one of: ipc, verbs (got: $NIXL_TRANSPORT)"; exit 1 ;;
+esac
+
+if [[ "$NIXL_TRANSPORT" == "verbs" ]] && [[ "$DISAGG" -eq 1 ]] && [[ "$SIDE_CHANNEL_HOST" == "localhost" ]]; then
+    echo "Warning: verbs mode with --side-channel-host localhost only works for same-host setups; use a routable IP/hostname for multi-host prefill/decode."
+fi
+
 # ── Build flags ──
 EP_FLAG=""
 if [[ "$EP" -eq 1 ]]; then
@@ -285,16 +331,29 @@ fi
 
 # ── Disagg-only flags ──
 KV_CONFIG_FLAG=""
-IPC_ENV=()
+DISAGG_ENV=()
 if [[ "$DISAGG" -eq 1 ]]; then
+    DISAGG_UCX_TLS="$UCX_TLS_OVERRIDE"
+    if [[ -z "$DISAGG_UCX_TLS" ]]; then
+        case "$NIXL_TRANSPORT" in
+            ipc)   DISAGG_UCX_TLS="self,tcp,ze_ipc,ze_copy" ;;
+            verbs) DISAGG_UCX_TLS="ib,rc,ze_copy" ;;
+        esac
+    fi
+    if [[ "$NIXL_TRANSPORT" == "verbs" ]] && [[ -z "$UCX_NET_DEVICES" ]]; then
+        UCX_NET_DEVICES="all"
+    fi
     KV_CONFIG_FLAG='--kv-transfer-config {"kv_connector":"NixlConnector","kv_role":"kv_both","kv_buffer_device":"xpu"}'
-    IPC_ENV=(
+    DISAGG_ENV=(
         UCX_MEMTYPE_CACHE=0
-        UCX_TLS=self,tcp,ze_ipc,ze_copy
+        UCX_TLS="$DISAGG_UCX_TLS"
         LD_LIBRARY_PATH="/opt/venv/lib/python3.12/site-packages/.nixl.mesonpy.libs/plugins:${LD_LIBRARY_PATH:-}"
-        VLLM_NIXL_SIDE_CHANNEL_HOST=localhost
+        VLLM_NIXL_SIDE_CHANNEL_HOST="$SIDE_CHANNEL_HOST"
         VLLM_NIXL_SIDE_CHANNEL_PORT="$SIDE_CHANNEL_PORT"
     )
+    if [[ -n "$UCX_NET_DEVICES" ]]; then
+        DISAGG_ENV+=(UCX_NET_DEVICES="$UCX_NET_DEVICES")
+    fi
 fi
 
 # ── Log rotation ──
@@ -313,6 +372,11 @@ rotate_log "$LOG_FILE"
     [[ -n "$QUANT" ]] && printf "║  %-63s║\n" "Quant: $QUANT  |  Dtype: $DTYPE" \
                       || printf "║  %-63s║\n" "Dtype: $DTYPE"
     printf "║  %-63s║\n" "Attn: $ATTN_BACKEND  |  All2All: $ALL2ALL_BACKEND"
+    if [[ "$DISAGG" -eq 1 ]]; then
+        printf "║  %-63s║\n" "NIXL transport: $NIXL_TRANSPORT  |  Side host: $SIDE_CHANNEL_HOST"
+        printf "║  %-63s║\n" "Resolved UCX_TLS: $DISAGG_UCX_TLS"
+        [[ -n "$UCX_NET_DEVICES" ]] && printf "║  %-63s║\n" "UCX_NET_DEVICES: $UCX_NET_DEVICES"
+    fi
     echo "╚══════════════════════════════════════════════════════════════════╝"
     echo ""
 } >> "$LOG_FILE"
@@ -321,19 +385,26 @@ rotate_log "$LOG_FILE"
 echo "Starting $LABEL instance on port $PORT (TP=$TP, DP=$DP, devices=$DEVICE_MASK, all2all=$ALL2ALL_BACKEND)"
 [[ -n "$NUMA_CONTROL" ]] && echo "  NUMA binding: $NUMA_CONTROL"
 [[ -n "$QUANT" ]] && echo "  Quantization: $QUANT"
+if [[ "$DISAGG" -eq 1 ]]; then
+    echo "  NIXL transport: $NIXL_TRANSPORT"
+    echo "  Resolved UCX_TLS: $DISAGG_UCX_TLS"
+    echo "  API host: $SERVE_HOST"
+    echo "  Side-channel host: $SIDE_CHANNEL_HOST"
+    [[ -n "$UCX_NET_DEVICES" ]] && echo "  UCX_NET_DEVICES: $UCX_NET_DEVICES"
+fi
 
 env \
     ZE_AFFINITY_MASK="$DEVICE_MASK" \
     VLLM_USE_V1=1 \
     VLLM_WORKER_MULTIPROC_METHOD=spawn \
     VLLM_ENABLE_V1_MULTIPROCESSING=1 \
-    "${IPC_ENV[@]}" \
+    "${DISAGG_ENV[@]}" \
     vllm serve "$MODEL" \
     --tensor-parallel-size "$TP" \
     $DP_FLAG \
     $EP_FLAG \
     --all2all-backend "$ALL2ALL_BACKEND" \
-    --host localhost \
+    --host "$SERVE_HOST" \
     --port "$PORT" \
     --seed 42 \
     --enforce-eager \
