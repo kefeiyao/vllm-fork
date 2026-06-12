@@ -456,18 +456,24 @@ class HYV3Attention(nn.Module):
             self._fused_mode = 0
 
     def _maybe_init_fused_qk_weights(self) -> None:
-        """Build float32 copies of the q/k norm weights for the kernel."""
+        """Build float32 copies of the q/k norm weights for the kernel.
+
+        If the weights are already float32 we skip the dtype conversion and
+        only ensure contiguity.
+        """
         w = self.q_norm.weight
         if (
             self._q_norm_weight_f32 is None
             or self._q_norm_weight_f32.device != w.device
         ):
-            self._q_norm_weight_f32 = (
-                self.q_norm.weight.detach().to(torch.float32).contiguous()
-            )
-            self._k_norm_weight_f32 = (
-                self.k_norm.weight.detach().to(torch.float32).contiguous()
-            )
+            qw = self.q_norm.weight.detach()
+            if qw.dtype != torch.float32:
+                qw = qw.to(torch.float32)
+            self._q_norm_weight_f32 = qw.contiguous()
+            kw = self.k_norm.weight.detach()
+            if kw.dtype != torch.float32:
+                kw = kw.to(torch.float32)
+            self._k_norm_weight_f32 = kw.contiguous()
 
     def forward(
         self,

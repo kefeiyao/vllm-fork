@@ -23,6 +23,8 @@
 # limitations under the License.
 """Inference-only Qwen3 model compatible with HuggingFace weights."""
 
+import importlib.util
+import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -54,6 +56,140 @@ from .qwen2 import Qwen2Model
 from .utils import AutoWeightsLoader, PPMissingLayer, extract_layer_index, maybe_prefix
 
 logger = init_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Optional fused Q/K RMSNorm kernels (XPU), selected via the environment
+# variable ``VLLM_USE_FUSED_QK_RMSNORM``:
+#   0 (default) : disabled, use the regular separate Q/K RMSNorm + RoPE.
+#   1           : fused Q/K RMSNorm only, via the standalone ``qk_rms_norm_ops``
+#                 SYCL/XPU extension (RoPE still applied separately afterwards).
+#   2           : fused Q/K RMSNorm *and* RoPE, via the ``fused_qk_norm_rope``
+#                 op registered by the vllm-xpu-kernels extension
+#                 (``torch.ops._C.fused_qk_norm_rope``).
+#
+# Qwen3 applies QK-Norm *before* RoPE (norm-then-rope), which matches both
+# fused kernels, so all three modes are mathematically equivalent here.
+# ---------------------------------------------------------------------------
+_qk_rms_norm_ops = None
+_qk_rms_norm_import_failed = False
+
+
+def _fused_qk_rmsnorm_mode() -> int:
+    """Parse ``VLLM_USE_FUSED_QK_RMSNORM`` into an integer mode (0/1/2)."""
+    raw = os.getenv("VLLM_USE_FUSED_QK_RMSNORM", "0").strip().lower()
+    if raw == "0":
+        return 0
+    if raw == "1":
+        return 1
+    if raw == "2":
+        return 2
+    logger.warning(
+        "Unrecognized VLLM_USE_FUSED_QK_RMSNORM=%r; expected 0, 1, or 2. "
+        "Defaulting to 0 (disabled).",
+        raw,
+    )
+    return 0
+
+
+def _resolve_qk_rms_norm_so_path() -> str | None:
+    """Resolve the path to ``qk_rms_norm_ops.so`` from the env var."""
+    path = os.getenv("VLLM_QK_RMS_NORM_OPS_PATH")
+    if not path:
+        return None
+    if os.path.isdir(path):
+        candidate = os.path.join(path, "qk_rms_norm_ops.so")
+        return candidate if os.path.isfile(candidate) else None
+    return path if os.path.isfile(path) else None
+
+
+def _get_qk_rms_norm_ops():
+    """Lazily import the ``qk_rms_norm_ops`` extension (or return None).
+
+    The extension is shipped as a standalone ``qk_rms_norm_ops.so`` rather than
+    an installed package. We first try a normal import (works if its directory
+    is on ``PYTHONPATH``), then fall back to loading the shared object directly
+    from a path/directory given by ``VLLM_QK_RMS_NORM_OPS_PATH``.
+    """
+    global _qk_rms_norm_ops, _qk_rms_norm_import_failed
+    if _qk_rms_norm_ops is not None or _qk_rms_norm_import_failed:
+        return _qk_rms_norm_ops
+
+    # 1) Normal import (directory on PYTHONPATH / installed package).
+    try:
+        import qk_rms_norm_ops  # type: ignore
+
+        _qk_rms_norm_ops = qk_rms_norm_ops
+        return _qk_rms_norm_ops
+    except ImportError:
+        pass
+
+    # 2) Load the shared object directly from a user-provided location.
+    so_path = _resolve_qk_rms_norm_so_path()
+    if so_path is not None:
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "qk_rms_norm_ops", so_path
+            )
+            if spec is not None and spec.loader is not None:
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                _qk_rms_norm_ops = module
+                logger.info("Loaded fused Q/K RMSNorm extension from %s", so_path)
+                return _qk_rms_norm_ops
+        except Exception as e:  # noqa: BLE001 - report and fall back
+            logger.warning(
+                "Failed to load fused Q/K RMSNorm extension from %s: %s",
+                so_path,
+                e,
+            )
+
+    _qk_rms_norm_import_failed = True
+    logger.warning(
+        "VLLM_USE_FUSED_QK_RMSNORM is set but the 'qk_rms_norm_ops' extension "
+        "could not be imported. Set VLLM_QK_RMS_NORM_OPS_PATH to the "
+        "'qk_rms_norm_ops.so' file (or its directory), or add that directory "
+        "to PYTHONPATH. Falling back to the default separate Q/K RMSNorm "
+        "implementation."
+    )
+    return _qk_rms_norm_ops
+
+
+_fused_qk_norm_rope_op = None
+_fused_qk_norm_rope_lookup_failed = False
+
+
+def _get_fused_qk_norm_rope_op():
+    """Return ``torch.ops._C.fused_qk_norm_rope`` if available, else None.
+
+    This op is registered by the vllm-xpu-kernels extension and fuses Q/K
+    RMSNorm together with RoPE in a single kernel.
+    """
+    global _fused_qk_norm_rope_op, _fused_qk_norm_rope_lookup_failed
+    if _fused_qk_norm_rope_op is not None or _fused_qk_norm_rope_lookup_failed:
+        return _fused_qk_norm_rope_op
+
+    # Best-effort import to ensure custom ops are registered under torch.ops._C.
+    try:
+        import vllm._C  # type: ignore  # noqa: F401
+    except ImportError:
+        pass
+
+    try:
+        op = torch.ops._C.fused_qk_norm_rope
+        # Touch the op to make sure it is actually registered.
+        _ = op.default
+        _fused_qk_norm_rope_op = op
+        logger.info("Using fused Q/K RMSNorm+RoPE op (torch.ops._C).")
+        return _fused_qk_norm_rope_op
+    except (AttributeError, RuntimeError):
+        _fused_qk_norm_rope_lookup_failed = True
+        logger.warning(
+            "VLLM_USE_FUSED_QK_RMSNORM=2 requested but the "
+            "'fused_qk_norm_rope' op (vllm-xpu-kernels) is not registered. "
+            "Falling back to the default separate Q/K RMSNorm + RoPE path."
+        )
+        return None
 
 
 class Qwen3Attention(nn.Module):
@@ -141,6 +277,51 @@ class Qwen3Attention(nn.Module):
         )
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.rms_norm_eps = rms_norm_eps
+
+        # Resolve the optional fused-kernel mode (0/1/2) once, at init.
+        #   1 -> fused Q/K RMSNorm only (qk_rms_norm_ops)
+        #   2 -> fused Q/K RMSNorm + RoPE (torch.ops._C.fused_qk_norm_rope)
+        # If the requested kernel is unavailable we fall back to mode 0.
+        self._fused_mode = 0
+        self._qk_rms_norm_ops = None
+        self._fused_qk_norm_rope_op = None
+        requested_mode = _fused_qk_rmsnorm_mode()
+        if requested_mode == 1:
+            ops = _get_qk_rms_norm_ops()
+            if ops is not None:
+                self._qk_rms_norm_ops = ops
+                self._fused_mode = 1
+        elif requested_mode == 2:
+            op = _get_fused_qk_norm_rope_op()
+            if op is not None:
+                self._fused_qk_norm_rope_op = op
+                self._fused_mode = 2
+        # Float32 copies of the norm weights required by the mode-1 kernel;
+        # built lazily on first forward (after weights are loaded). The
+        # mode-2 kernel consumes the weights in the model dtype directly.
+        self._q_norm_weight_f32: torch.Tensor | None = None
+        self._k_norm_weight_f32: torch.Tensor | None = None
+
+    def _maybe_init_fused_qk_weights(self) -> None:
+        """Build float32 copies of the q/k norm weights for the kernel.
+
+        If the weights are already float32 we skip the dtype conversion and
+        only ensure contiguity.
+        """
+        w = self.q_norm.weight
+        if (
+            self._q_norm_weight_f32 is None
+            or self._q_norm_weight_f32.device != w.device
+        ):
+            qw = self.q_norm.weight.detach()
+            if qw.dtype != torch.float32:
+                qw = qw.to(torch.float32)
+            self._q_norm_weight_f32 = qw.contiguous()
+            kw = self.k_norm.weight.detach()
+            if kw.dtype != torch.float32:
+                kw = kw.to(torch.float32)
+            self._k_norm_weight_f32 = kw.contiguous()
 
     def forward(
         self,
@@ -148,15 +329,61 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        # Add qk-norm
-        q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
-        q_by_head = self.q_norm(q_by_head)
-        q = q_by_head.view(q.shape)
-        k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
-        k_by_head = self.k_norm(k_by_head)
-        k = k_by_head.view(k.shape)
-        q, k = self.rotary_emb(positions, q, k)
+        rope_applied = False
+        if self._fused_mode == 1:
+            # Mode 1: fused kernel normalizes the Q and K head regions of `qkv`
+            # in-place (V untouched). RoPE is still applied separately below.
+            qkv = qkv.contiguous()
+            self._maybe_init_fused_qk_weights()
+            self._qk_rms_norm_ops.qk_rms_norm_forward(
+                qkv,
+                self._q_norm_weight_f32,
+                self._k_norm_weight_f32,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.head_dim,
+                self.rms_norm_eps,
+            )
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        elif self._fused_mode == 2:
+            # Mode 2: fused kernel applies Q/K RMSNorm *and* RoPE in-place on
+            # `qkv` (V untouched), so we skip the separate rotary_emb call.
+            qkv = qkv.contiguous()
+            position_ids = positions
+            if position_ids.dtype != torch.int64:
+                position_ids = position_ids.to(torch.int64)
+            position_ids = position_ids.contiguous()
+            self._fused_qk_norm_rope_op(
+                qkv,
+                self.num_heads,
+                self.num_kv_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.rms_norm_eps,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.rotary_emb.cos_sin_cache,
+                self.rotary_emb.is_neox_style,
+                position_ids,
+            )
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            rope_applied = True
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            # Add qk-norm
+            q_by_head = q.view(
+                *q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim
+            )
+            q_by_head = self.q_norm(q_by_head)
+            q = q_by_head.view(q.shape)
+            k_by_head = k.view(
+                *k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim
+            )
+            k_by_head = self.k_norm(k_by_head)
+            k = k_by_head.view(k.shape)
+        if not rope_applied:
+            q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output

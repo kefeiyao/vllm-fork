@@ -24,6 +24,8 @@
 # limitations under the License.
 """Inference-only HunYuan model compatible with HuggingFace weights."""
 
+import importlib.util
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -40,6 +42,7 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
@@ -83,6 +86,118 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
+
+
+logger = init_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Optional fused Q/K RMSNorm kernel (XPU `qk_rms_norm_ops` extension).
+#
+# IMPORTANT correctness note for HunYuan:
+#   HunYuan applies RoPE *before* QK-Norm (rope-then-norm). The fused
+#   norm+rope kernel (`fused_qk_norm_rope`, "mode 2") instead does
+#   norm-then-rope, which is NOT mathematically equivalent here, so mode 2 is
+#   intentionally *not* supported for this model. Only the standalone
+#   `qk_rms_norm_ops` kernel ("mode 1") is wired in, and it is applied *after*
+#   RoPE so the result matches the reference math exactly.
+#
+# Enable with `VLLM_USE_FUSED_QK_RMSNORM=1`.
+# Optionally point `VLLM_QK_RMS_NORM_OPS_PATH` at the built `.so` (file or the
+# directory containing `qk_rms_norm_ops.so`) when it is not importable.
+# ---------------------------------------------------------------------------
+
+_qk_rms_norm_ops = None
+_qk_rms_norm_import_failed = False
+
+# Head dimensions supported by the qk_rms_norm_ops kernel.
+_QK_RMS_NORM_SUPPORTED_HEAD_DIMS = frozenset({8, 16, 32, 64, 96, 128, 256, 512, 1024})
+
+
+def _fused_qk_rmsnorm_mode() -> int:
+    """Parse ``VLLM_USE_FUSED_QK_RMSNORM`` into an integer mode.
+
+    Only the exact strings ``"0"``, ``"1"``, and ``"2"`` are accepted; any
+    other value disables the fused path.
+
+    0: disabled, 1: fused Q/K RMSNorm (the only supported mode here).
+    Mode 2 (fused norm+rope) is unsupported for HunYuan because the model
+    applies RoPE before the norm; requesting it falls back to mode 1.
+    """
+    raw = os.environ.get("VLLM_USE_FUSED_QK_RMSNORM")
+    if raw is None:
+        return 0
+    value = raw.strip()
+    if value == "0":
+        return 0
+    if value == "1":
+        return 1
+    if value == "2":
+        logger.warning(
+            "VLLM_USE_FUSED_QK_RMSNORM=2 (fused norm+rope) is not supported "
+            "for HunYuan because it applies RoPE before QK-Norm; the fused "
+            "norm+rope kernel would reorder the math. Falling back to the "
+            "correctness-preserving fused QK-Norm path (mode 1)."
+        )
+        return 1
+    logger.warning(
+        "Unrecognized VLLM_USE_FUSED_QK_RMSNORM=%r; expected 0, 1, or 2. "
+        "Disabling fused Q/K RMSNorm.",
+        raw,
+    )
+    return 0
+
+
+def _resolve_qk_rms_norm_so_path() -> str | None:
+    """Resolve an explicit path to the ``qk_rms_norm_ops`` shared object."""
+    path = os.environ.get("VLLM_QK_RMS_NORM_OPS_PATH")
+    if not path:
+        return None
+    if os.path.isdir(path):
+        candidate = os.path.join(path, "qk_rms_norm_ops.so")
+        return candidate if os.path.isfile(candidate) else None
+    return path if os.path.isfile(path) else None
+
+
+def _get_qk_rms_norm_ops():
+    """Import (and cache) the ``qk_rms_norm_ops`` extension, if available."""
+    global _qk_rms_norm_ops, _qk_rms_norm_import_failed
+    if _qk_rms_norm_ops is not None or _qk_rms_norm_import_failed:
+        return _qk_rms_norm_ops
+    try:
+        import qk_rms_norm_ops  # type: ignore
+
+        _qk_rms_norm_ops = qk_rms_norm_ops
+        return _qk_rms_norm_ops
+    except ImportError:
+        pass
+
+    so_path = _resolve_qk_rms_norm_so_path()
+    if so_path is not None:
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "qk_rms_norm_ops", so_path
+            )
+            if spec is not None and spec.loader is not None:
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                _qk_rms_norm_ops = module
+                logger.info(
+                    "Loaded fused Q/K RMSNorm extension from %s", so_path
+                )
+                return _qk_rms_norm_ops
+        except (ImportError, OSError) as exc:
+            logger.warning(
+                "Failed to load qk_rms_norm_ops from %s: %s", so_path, exc
+            )
+
+    _qk_rms_norm_import_failed = True
+    logger.warning(
+        "VLLM_USE_FUSED_QK_RMSNORM is set but the qk_rms_norm_ops extension "
+        "could not be imported. Set VLLM_QK_RMS_NORM_OPS_PATH to the built "
+        ".so. Falling back to the default Q/K RMSNorm."
+    )
+    return None
 
 
 def _is_moe(config: PretrainedConfig) -> bool:
@@ -223,8 +338,49 @@ class HunYuanAttention(nn.Module):
         )
 
         if self.use_qk_norm:
-            self.query_layernorm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-            self.key_layernorm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.rms_norm_eps = config.rms_norm_eps
+            self.query_layernorm = RMSNorm(self.head_dim, eps=self.rms_norm_eps)
+            self.key_layernorm = RMSNorm(self.head_dim, eps=self.rms_norm_eps)
+
+            # Optional fused Q/K RMSNorm (XPU `qk_rms_norm_ops`). HunYuan does
+            # RoPE-then-norm, so we only support the standalone norm kernel
+            # (mode 1) and apply it *after* RoPE to preserve correctness.
+            self._fused_mode = _fused_qk_rmsnorm_mode()
+            if self._fused_mode and self.head_dim not in _QK_RMS_NORM_SUPPORTED_HEAD_DIMS:
+                logger.warning(
+                    "Fused Q/K RMSNorm requested but head_dim=%d is not "
+                    "supported by qk_rms_norm_ops; using the default path.",
+                    self.head_dim,
+                )
+                self._fused_mode = 0
+            if self._fused_mode:
+                self._qk_rms_norm_ops = _get_qk_rms_norm_ops()
+                if self._qk_rms_norm_ops is None:
+                    self._fused_mode = 0
+            else:
+                self._qk_rms_norm_ops = None
+            self._q_norm_weight_f32 = None
+            self._k_norm_weight_f32 = None
+        else:
+            self._fused_mode = 0
+
+    def _maybe_init_fused_qk_weights(self) -> None:
+        """Lazily build float32 contiguous copies of the norm weights.
+
+        ``qk_rms_norm_ops`` requires float32 weights, whereas the model stores
+        them in its compute dtype (e.g. bfloat16). If the weights are already
+        float32 we skip the dtype conversion and only ensure contiguity.
+        """
+        if self._q_norm_weight_f32 is None:
+            w = self.query_layernorm.weight.detach()
+            if w.dtype != torch.float32:
+                w = w.to(torch.float32)
+            self._q_norm_weight_f32 = w.contiguous()
+        if self._k_norm_weight_f32 is None:
+            w = self.key_layernorm.weight.detach()
+            if w.dtype != torch.float32:
+                w = w.to(torch.float32)
+            self._k_norm_weight_f32 = w.contiguous()
 
     def forward(
         self,
@@ -237,12 +393,34 @@ class HunYuanAttention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         ori_k = k
         if self.use_qk_norm:
-            q = self.query_layernorm(
-                q.view(-1, self.num_heads, self.head_dim).contiguous()
-            )
-            k = self.key_layernorm(
-                k.view(-1, self.num_kv_heads, self.head_dim).contiguous()
-            )
+            if self._fused_mode:
+                # Correctness-preserving fused path: apply the fused Q/K
+                # RMSNorm *after* RoPE. The kernel operates in-place on a
+                # fused q|k|v tensor and leaves the V region untouched.
+                # `ori_k` keeps referencing the pre-norm (post-RoPE) `k`
+                # because `torch.cat` copies into a fresh buffer.
+                self._maybe_init_fused_qk_weights()
+                qkv_fused = torch.cat([q, k, v], dim=-1).contiguous()
+                self._qk_rms_norm_ops.qk_rms_norm_forward(
+                    qkv_fused,
+                    self._q_norm_weight_f32,
+                    self._k_norm_weight_f32,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    self.head_dim,
+                    self.rms_norm_eps,
+                )
+                q, k, v = qkv_fused.split(
+                    [self.q_size, self.kv_size, self.kv_size], dim=-1
+                )
+            else:
+                q = self.query_layernorm(
+                    q.view(-1, self.num_heads, self.head_dim).contiguous()
+                )
+                k = self.key_layernorm(
+                    k.view(-1, self.num_kv_heads, self.head_dim).contiguous()
+                )
 
         attn_output = self.attn(q, k, v)
         # For o_proj
