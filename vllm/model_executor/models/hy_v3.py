@@ -77,6 +77,47 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# When available, ``torch.ops._C.fused_qk_norm_rope`` (registered by the
+# vllm-xpu-kernels extension) applies Q/K RMSNorm together with RoPE in a
+# single in-place kernel.
+# ---------------------------------------------------------------------------
+_fused_qk_norm_rope_op = None
+_fused_qk_norm_rope_lookup_failed = False
+
+
+def _get_fused_qk_norm_rope_op():
+    """Return ``torch.ops._C.fused_qk_norm_rope`` if available, else None.
+
+    This op is registered by the vllm-xpu-kernels extension and fuses Q/K
+    RMSNorm together with RoPE in a single kernel.
+    """
+    global _fused_qk_norm_rope_op, _fused_qk_norm_rope_lookup_failed
+    if _fused_qk_norm_rope_op is not None or _fused_qk_norm_rope_lookup_failed:
+        return _fused_qk_norm_rope_op
+
+    # Best-effort import to ensure custom ops are registered under torch.ops._C.
+    try:
+        import vllm_xpu_kernels._C  # type: ignore  # noqa: F401
+    except ImportError:
+        pass
+
+    try:
+        op = torch.ops._C.fused_qk_norm_rope
+        # Touch the op to make sure it is actually registered.
+        _ = op.default
+        _fused_qk_norm_rope_op = op
+        logger.info("Using fused Q/K RMSNorm+RoPE op (torch.ops._C).")
+        return _fused_qk_norm_rope_op
+    except (AttributeError, RuntimeError):
+        _fused_qk_norm_rope_lookup_failed = True
+        logger.warning(
+            "The 'fused_qk_norm_rope' op (vllm-xpu-kernels) is not registered. "
+            "Falling back to the default separate Q/K RMSNorm + RoPE path."
+        )
+        return None
+
+
 class HYV3FeedForward(nn.Module):
     def __init__(
         self,
@@ -287,9 +328,14 @@ class HYV3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
         )
+        self._fused_qk_norm_rope_op = None
         if self.use_qk_norm:
             self.q_norm = RMSNorm(self.head_dim, rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, rms_norm_eps)
+            self.rms_norm_eps = rms_norm_eps
+            # Use the fused Q/K RMSNorm + RoPE kernel when available; otherwise
+            # fall back to the default separate Q/K RMSNorm + RoPE path.
+            self._fused_qk_norm_rope_op = _get_fused_qk_norm_rope_op()
 
     def forward(
         self,
@@ -297,21 +343,48 @@ class HYV3Attention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         output_shape = None
-        if self.use_qk_norm:
-            q_by_head = q.view(
-                *q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim
+        if self.use_qk_norm and self._fused_qk_norm_rope_op is not None:
+            # Fused kernel applies Q/K RMSNorm *and* RoPE in-place on `qkv`
+            # (V untouched), so we skip the separate rotary_emb call.
+            qkv = qkv.contiguous()
+            position_ids = positions
+            if position_ids.dtype != torch.int64:
+                position_ids = position_ids.to(torch.int64)
+            position_ids = position_ids.contiguous()
+            self._fused_qk_norm_rope_op(
+                qkv,
+                self.num_heads,
+                self.num_kv_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.rms_norm_eps,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.rotary_emb.cos_sin_cache,
+                self.rotary_emb.is_neox_style,
+                position_ids,
             )
-            q_by_head = self.q_norm(q_by_head)
-            q = q_by_head.view(q.shape)
+            q, k, v = qkv.split(
+                [self.q_size, self.kv_size, self.kv_size], dim=-1
+            )
+        else:
+            q, k, v = qkv.split(
+                [self.q_size, self.kv_size, self.kv_size], dim=-1
+            )
+            if self.use_qk_norm:
+                q_by_head = q.view(
+                    *q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim
+                )
+                q_by_head = self.q_norm(q_by_head)
+                q = q_by_head.view(q.shape)
 
-            k_by_head = k.view(
-                *k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim
-            )
-            k_by_head = self.k_norm(k_by_head)
-            k = k_by_head.view(k.shape)
-        q, k = self.rotary_emb(positions, q, k)
+                k_by_head = k.view(
+                    *k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim
+                )
+                k_by_head = self.k_norm(k_by_head)
+                k = k_by_head.view(k.shape)
+            q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, output_shape)
         attn_output = attn_output.view(q.shape[0], -1)
         output, _ = self.o_proj(attn_output)
